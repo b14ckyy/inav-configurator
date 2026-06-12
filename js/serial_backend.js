@@ -496,7 +496,7 @@ var SerialBackend = (function () {
                 $('#hardware-roundtrip').text("HW round trip: " + mspQueue.getHardwareRoundtrip().toFixed(0));
             }, 100);
 
-            interval.add('global_data_refresh', periodicStatusUpdater.run, periodicStatusUpdater.getUpdateInterval(CONFIGURATOR.connection.bitrate), false);
+            interval.add('global_data_refresh', periodicStatusUpdater.run, periodicStatusUpdater.getPollInterval(), false);
         });
     }
 

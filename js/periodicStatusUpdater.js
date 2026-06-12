@@ -5,6 +5,7 @@ import FC from './fc';
 import CONFIGURATOR from './data_storage';
 import MSP from './msp';
 import MSPCodes from './msp/MSPCodes';
+import mspQueue from './serial_queue';
 
  var periodicStatusUpdater = (function () {
 
@@ -12,6 +13,16 @@ import MSPCodes from './msp/MSPCodes';
         privateScope = {};
 
     var stoppped = false;
+
+    // Status requests are sent one per tick (round-robin) instead of all at once,
+    // so settings downloads can interleave between polls instead of waiting behind a burst.
+    privateScope.pollMessages = [
+        MSPCodes.MSP_SENSOR_STATUS,
+        MSPCodes.MSPV2_INAV_STATUS,
+        MSPCodes.MSP_ACTIVEBOXES,
+        MSPCodes.MSPV2_INAV_ANALOG,
+    ];
+    privateScope.pollIndex = 0;
 
     /**
      *
@@ -35,9 +46,23 @@ import MSPCodes from './msp/MSPCodes';
         }
     };
 
+    // Time to refresh all status messages once. Wireless links (hard lock) are
+    // polled slower to leave more bandwidth for settings downloads.
+    publicScope.getPollCycle = function () {
+        if (mspQueue.getLockMethod() === 'hard') {
+            return 1000;
+        }
+        return publicScope.getUpdateInterval(CONFIGURATOR.connection ? CONFIGURATOR.connection.bitrate : undefined);
+    };
+
+    // Per-tick interval: one status message per tick, spread evenly across the cycle.
+    publicScope.getPollInterval = function () {
+        return Math.round(publicScope.getPollCycle() / privateScope.pollMessages.length);
+    };
+
     privateScope.updateView = function () {
 
-        var active = ((Date.now() - MSP.analog_last_received_timestamp) < publicScope.getUpdateInterval(CONFIGURATOR.connection.bitrate) * 3);
+        var active = ((Date.now() - MSP.analog_last_received_timestamp) < publicScope.getPollCycle() * 3);
 
         if (FC.isModeEnabled('ARM')) {
             $("#armedIcon").removeClass('armed');
@@ -97,14 +122,15 @@ import MSPCodes from './msp/MSPCodes';
             display: 'inline-block'
         });
 
-        if (!stoppped && !CONFIGURATOR.cliActive) {
+        if (stoppped || CONFIGURATOR.cliActive) {
+            return;
+        }
 
-            MSP.send_message(MSPCodes.MSP_SENSOR_STATUS, false, false);
-            MSP.send_message(MSPCodes.MSPV2_INAV_STATUS, false, false);
-            MSP.send_message(MSPCodes.MSP_ACTIVEBOXES, false, false);
-            MSP.send_message(MSPCodes.MSPV2_INAV_ANALOG, false, false);
-            
+        MSP.send_message(privateScope.pollMessages[privateScope.pollIndex], false, false);
+        privateScope.pollIndex++;
 
+        if (privateScope.pollIndex >= privateScope.pollMessages.length) {
+            privateScope.pollIndex = 0;
             privateScope.updateView();
         }
     };
