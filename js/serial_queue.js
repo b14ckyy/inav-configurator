@@ -7,7 +7,17 @@ import eventFrequencyAnalyzer from './eventFrequencyAnalyzer';
 import mspDeduplicationQueue from './msp/mspDeduplicationQueue';
 
 // Tunnel replies arrive in chunks; silence this long since the last one means a chunk was lost.
-const TUNNEL_SILENCE_TIMEOUT_MS = 500;
+const TUNNEL_SILENCE_MIN_MS = 500;
+const TUNNEL_SILENCE_MAX_MS = 3000;
+// A wire this slow cannot carry the telemetry feed's base set (measured at 4800 baud).
+const TUNNEL_SLOW_SERIAL_MAX_BAUD = 9600;
+// A reply may queue behind a full FC TX ring (255 B), then its own chunk (145 B) after our request (60 B).
+const TUNNEL_SERIAL_WORST_CASE_BYTES = 460;
+const TUNNEL_SERIAL_MARGIN_MS = 200;
+// Headroom over the slowest reply seen; a decaying maximum, since an average sags between bursts.
+const TUNNEL_LEARNED_HEADROOM = 1.5;
+const TUNNEL_LEARNED_DECAY = 0.9;
+const TUNNEL_LEARNED_DECAY_PERIOD_MS = 60000;
 // Flash erase blocks the FC for well over a second before the first reply byte.
 const TUNNEL_SLOW_REQUEST_TIMEOUT_MS = 5000;
 // Handlers that write the config flash before replying (fc_msp.c, maintenance-10.x).
@@ -70,6 +80,11 @@ var mspQueue = function () {
     // code -> one-shot stale window: after a lapse, or after a retry was answered (duplicate expected)
     privateScope.staleWatch = new Map();
     privateScope.staleReplyCount = 0;
+    privateScope.silencePriorMs = TUNNEL_SILENCE_MIN_MS;
+    privateScope.serialBaud = 0;
+    privateScope.silenceLearnedMs = 0;
+    privateScope.silenceDecayFrom = 0;
+    privateScope.silenceLoggedMs = null;
 
     privateScope.queueLocked = false;
 
@@ -374,14 +389,119 @@ var mspQueue = function () {
         return privateScope.queue;
     };
 
-    // The tunnel has one MSP parser per port on the FC and replies carry no request id: strictly one in flight.
-    publicScope.setTunnelMode = function (enabled) {
+    /**
+     * The tunnel has one MSP parser per port on the FC and replies carry no request id: strictly one in flight.
+     * @param {number} serialBaud baud rate of a serial port, 0 when the link behind the connection is unknown
+     */
+    publicScope.setTunnelMode = function (enabled, serialBaud = 0) {
         privateScope.tunnelMode = enabled;
         privateScope.lockMethod = enabled ? 'hard' : privateScope.requestedLockMethod;
         privateScope.clearTunnelTimer();
         privateScope.tunnelPending = null;
         privateScope.staleWatch.clear();
         privateScope.staleReplyCount = 0;
+        privateScope.silencePriorMs = enabled ? privateScope.serialSilencePrior(serialBaud) : TUNNEL_SILENCE_MIN_MS;
+        privateScope.serialBaud = enabled && serialBaud > 0 ? serialBaud : 0;
+        privateScope.silenceLearnedMs = 0;
+        privateScope.silenceDecayFrom = Date.now();
+        privateScope.silenceLoggedMs = null;
+    };
+
+    privateScope.serialSilencePrior = function (baud) {
+        if (!Number.isFinite(baud) || baud <= 0) {
+            return TUNNEL_SILENCE_MIN_MS;
+        }
+        const drainMs = TUNNEL_SERIAL_WORST_CASE_BYTES * 10 / baud * 1000;
+        return privateScope.clampSilence(drainMs + TUNNEL_SERIAL_MARGIN_MS);
+    };
+
+    privateScope.clampSilence = function (ms) {
+        return Math.round(Math.min(TUNNEL_SILENCE_MAX_MS, Math.max(TUNNEL_SILENCE_MIN_MS, ms)));
+    };
+
+    publicScope.getTunnelSilencePrior = function () {
+        return privateScope.silencePriorMs;
+    };
+
+    publicScope.hasSlowSerialPrior = function () {
+        return privateScope.serialBaud > 0 && privateScope.serialBaud <= TUNNEL_SLOW_SERIAL_MAX_BAUD;
+    };
+
+    publicScope.getTunnelSilenceWindow = function () {
+        return privateScope.tunnelSilenceWindowMs();
+    };
+
+    privateScope.tunnelSilenceWindowMs = function () {
+        privateScope.decayLearnedSilence();
+        const wantedMs = Math.max(privateScope.silencePriorMs, privateScope.silenceLearnedMs);
+        const windowMs = privateScope.clampSilence(wantedMs);
+        if (windowMs !== privateScope.silenceLoggedMs) {
+            privateScope.silenceLoggedMs = windowMs;
+            console.log('MSP tunnel: silence window ' + windowMs + ' ms');
+        }
+        return windowMs;
+    };
+
+    // 10 % per full minute without a late reply.
+    privateScope.decayLearnedSilence = function () {
+        const periods = Math.floor((Date.now() - privateScope.silenceDecayFrom) / TUNNEL_LEARNED_DECAY_PERIOD_MS);
+        if (periods > 0) {
+            privateScope.silenceLearnedMs *= TUNNEL_LEARNED_DECAY ** periods;
+            privateScope.silenceDecayFrom += periods * TUNNEL_LEARNED_DECAY_PERIOD_MS;
+        }
+    };
+
+    // lateReply: a stale reply proves the link is this slow now, even when it sets no new maximum.
+    privateScope.learnSilence = function (latencyMs, lateReply = false) {
+        privateScope.decayLearnedSilence();
+        const candidate = Math.min(TUNNEL_SILENCE_MAX_MS, latencyMs * TUNNEL_LEARNED_HEADROOM);
+        const raised = candidate > privateScope.silenceLearnedMs;
+        if (raised) {
+            privateScope.silenceLearnedMs = candidate;
+        }
+        if (raised || lateReply) {
+            privateScope.silenceDecayFrom = Date.now();
+        }
+        privateScope.tunnelSilenceWindowMs();
+    };
+
+    // First-chunk latency and inter-chunk gaps of the pending request's own reply.
+    privateScope.noteTunnelChunk = function (request) {
+        const now = Date.now();
+        if (request.firstChunkAt === null) {
+            request.firstChunkAt = now;
+        } else {
+            request.maxChunkGap = Math.max(request.maxChunkGap, now - request.lastChunkAt);
+        }
+        request.lastChunkAt = now;
+    };
+
+    privateScope.resetChunkTiming = function (request) {
+        request.firstChunkAt = null;
+        request.lastChunkAt = null;
+        request.maxChunkGap = 0;
+    };
+
+    /*
+     * A slow code's reply waits for a flash write, which says nothing about the link. A retry's first
+     * chunk may be an earlier attempt's reply: measured from the retry it is a lower bound, never more.
+     */
+    privateScope.learnFromReply = function (request) {
+        if (TUNNEL_SLOW_REQUEST_CODES.has(request.code)) {
+            return;
+        }
+        let latency = request.maxChunkGap;
+        if (request.firstChunkAt !== null) {
+            latency = Math.max(latency, request.firstChunkAt - request.lastSentOn);
+        }
+        privateScope.learnSilence(latency);
+    };
+
+    // A partial reply was dropped (lapse, reassembly timeout): its chunks must not time the next one.
+    publicScope.discardTunnelChunks = function () {
+        if (privateScope.tunnelPending) {
+            privateScope.resetChunkTiming(privateScope.tunnelPending);
+        }
     };
 
     // wrapFn runs per attempt at send time; resetFn drops reassembly state after a lost reply.
@@ -397,8 +517,10 @@ var mspQueue = function () {
     // Chunk progress never shortens a longer initial window (flash write before the reply).
     publicScope.notifyTunnelProgress = function () {
         if (privateScope.tunnelMode && privateScope.tunnelPending) {
+            privateScope.noteTunnelChunk(privateScope.tunnelPending);
             const remaining = privateScope.tunnelDeadline - Date.now();
-            privateScope.armTunnelTimer(privateScope.tunnelPending, Math.max(remaining, TUNNEL_SILENCE_TIMEOUT_MS));
+            const timeoutMs = Math.max(remaining, privateScope.tunnelSilenceWindowMs());
+            privateScope.armTunnelTimer(privateScope.tunnelPending, timeoutMs);
         }
     };
 
@@ -429,6 +551,7 @@ var mspQueue = function () {
      * An identical read already queued or in flight answers this caller too, instead of a
      * retry chain per rejected poll that keeps the code busy long after a stall.
      * A read is only shared while no write waits behind it: a re-read after a SET needs post-SET data.
+     * Never onto a request abandoned by a tab switch: its reply no longer fires any callback.
      * @returns {boolean} true when the message was attached to the existing request
      */
     publicScope.coalesce = function (message) {
@@ -441,7 +564,7 @@ var mspQueue = function () {
         const index = queue.findIndex(matches);
         let target = index >= 0 && !writeBehind(index) ? queue[index] : null;
         const pending = privateScope.tunnelPending;
-        if (index < 0 && pending && matches(pending) && !writeBehind(-1)) {
+        if (index < 0 && pending && !pending.abandoned && matches(pending) && !writeBehind(-1)) {
             target = pending;
         }
         if (!target) {
@@ -475,14 +598,23 @@ var mspQueue = function () {
             privateScope.clearTunnelTimer();
             privateScope.tunnelPending = null;
             privateScope.lastAnswered = pending;
+            privateScope.learnFromReply(pending);
             privateScope.updateWatchOnAnswer(pending);
             return true;
         }
+        // The chunks so far belonged to another reply.
+        if (pending) {
+            privateScope.resetChunkTiming(pending);
+        }
 
-        if (privateScope.isWatched(code)) {
+        const watch = privateScope.activeWatch(code);
+        if (watch) {
             privateScope.staleWatch.delete(code);
             privateScope.staleReplyCount++;
             console.log('MSP tunnel: dropped stale reply for ' + code + ' (' + privateScope.staleReplyCount + ' so far)');
+            if (!watch.slow) {
+                privateScope.learnSilence(Math.max(Date.now() - watch.sentAt, watch.answerLateness), true);
+            }
             return false;
         }
         return true;
@@ -507,8 +639,13 @@ var mspQueue = function () {
         if (request.code == MSPCodes.MSP_SET_REBOOT) {
             request.tunnelRetries = 0;
         }
+        // lastSentOn is set after this, so here it is still the previous attempt's.
+        request.previousSentOn = request.lastSentOn ?? null;
+        privateScope.resetChunkTiming(request);
         privateScope.tunnelPending = request;
-        privateScope.armTunnelTimer(request, TUNNEL_SLOW_REQUEST_CODES.has(request.code) ? TUNNEL_SLOW_REQUEST_TIMEOUT_MS : TUNNEL_SILENCE_TIMEOUT_MS);
+        const silenceMs = privateScope.tunnelSilenceWindowMs();
+        const slow = TUNNEL_SLOW_REQUEST_CODES.has(request.code);
+        privateScope.armTunnelTimer(request, slow ? Math.max(TUNNEL_SLOW_REQUEST_TIMEOUT_MS, silenceMs) : silenceMs);
     };
 
     privateScope.armTunnelTimer = function (request, timeoutMs) {
@@ -555,7 +692,7 @@ var mspQueue = function () {
             mspDeduplicationQueue.remove(request.code);
         }
         privateScope.resetDecoders();
-        privateScope.watchStale(request.code);
+        privateScope.watchStale(request);
         publicScope.freeSoftLock();
         publicScope.freeHardLock();
 
@@ -587,6 +724,7 @@ var mspQueue = function () {
     };
 
     privateScope.resetDecoders = function () {
+        publicScope.discardTunnelChunks();
         if (privateScope.decoderResetCallback) {
             privateScope.decoderResetCallback();
         }
@@ -596,8 +734,12 @@ var mspQueue = function () {
     };
 
     // A late reply of the lapsed attempt arrives within one silence window or is treated as lost.
-    privateScope.watchStale = function (code) {
-        privateScope.staleWatch.set(code, { until: Date.now() + TUNNEL_SILENCE_TIMEOUT_MS, duplicate: false });
+    privateScope.watchStale = function (request) {
+        const until = Date.now() + privateScope.tunnelSilenceWindowMs();
+        const slow = TUNNEL_SLOW_REQUEST_CODES.has(request.code);
+        privateScope.staleWatch.set(request.code, {
+            until, duplicate: false, sentAt: request.lastSentOn, answerLateness: 0, slow,
+        });
     };
 
     /*
@@ -608,14 +750,28 @@ var mspQueue = function () {
     privateScope.updateWatchOnAnswer = function (request) {
         const now = Date.now();
         if (request.isTunnelRetry) {
-            const windowMs = Math.min(TUNNEL_DUPLICATE_WATCH_MAX_MS, (now - request.sentOn) + TUNNEL_SILENCE_TIMEOUT_MS);
-            privateScope.staleWatch.set(request.code, { until: now + windowMs, windowMs, request, writeSince: false, duplicate: true });
+            const silenceMs = privateScope.tunnelSilenceWindowMs();
+            const maxMs = Math.max(TUNNEL_DUPLICATE_WATCH_MAX_MS, silenceMs);
+            const windowMs = Math.min(maxMs, (now - request.sentOn) + silenceMs);
+            // A duplicate proves this answer came from an earlier attempt, sent at previousSentOn at the latest.
+            privateScope.staleWatch.set(request.code, {
+                until: now + windowMs,
+                windowMs,
+                request,
+                writeSince: false,
+                duplicate: true,
+                sentAt: request.lastSentOn,
+                answerLateness: now - request.previousSentOn,
+                slow: TUNNEL_SLOW_REQUEST_CODES.has(request.code),
+            });
             return;
         }
         // An identical request may have taken the duplicate as its answer; its own reply is the duplicate now.
         const watch = privateScope.activeWatch(request.code);
         if (watch?.duplicate && !privateScope.isHeldBack(request)) {
             watch.until = now + watch.windowMs;
+            watch.sentAt = request.lastSentOn;
+            watch.answerLateness = 0;
         }
     };
 

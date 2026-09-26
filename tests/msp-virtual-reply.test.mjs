@@ -17,6 +17,10 @@ import {
     TELEMETRY_COVERED,
     BASE_INTERVALS_US,
     BOOST_INTERVAL_US,
+    RE_REQUEST_MS,
+    NEVER_SEEN_RE_REQUESTS,
+    MAX_RE_REQUESTS,
+    REDUCED_INTERVALS_US,
     UNBOOST_IDLE_MS,
     MIN_FRESH_WINDOW_MS,
     STATS_PERIOD_MS,
@@ -86,7 +90,7 @@ function makeFc() {
     };
 }
 
-function startSession(t, { withFeed = true } = {}) {
+function startSession(t, { withFeed = true, serialBaud = 0, roundTripMs = 0 } = {}) {
     // The previous feed's timers were mock timers and ended with its test.
     feed = null;
     MSP.virtualReplies = null;
@@ -95,7 +99,7 @@ function startSession(t, { withFeed = true } = {}) {
     logs.length = 0;
 
     t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 1000000 });
-    mspQueue.setTunnelMode(true);
+    mspQueue.setTunnelMode(true, serialBaud);
     mspQueue.setTransportTransform(
         (body) => {
             if (feed) {
@@ -106,7 +110,16 @@ function startSession(t, { withFeed = true } = {}) {
         () => link.resetReassembly()
     );
     fc = makeFc();
-    feed = withFeed ? new MavlinkTelemetryFeed({ link, send: (data, callback) => CONFIGURATOR.connection.send(data, callback), fc, msp: MSP, log: line => logs.push(line) }) : null;
+    feed = withFeed ? new MavlinkTelemetryFeed({
+        link,
+        send: (data, callback) => CONFIGURATOR.connection.send(data, callback),
+        fc,
+        msp: MSP,
+        log: line => logs.push(line),
+        roundTripMs: () => roundTripMs,
+        // as js/serial_backend.js
+        slowSerialLink: mspQueue.hasSlowSerialPrior(),
+    }) : null;
     MSP.virtualReplies = feed;
     if (feed) {
         feed.start();
@@ -418,7 +431,7 @@ test('a tab switch cancels virtual callbacks that have not fired yet', (t) => {
     assert.equal(fired, false);
 });
 
-test('without the feed (A/B flag off) everything goes on the wire and no interval is requested', (t) => {
+test('without the feed (switched off) everything goes on the wire and no interval is requested', (t) => {
     const storeWith = value => ({ get: (key, fallback) => (key === 'mavlink_telemetry_feed' && value !== undefined ? value : fallback) });
     assert.equal(isTelemetryFeedEnabled(storeWith(undefined)), true);
     assert.equal(isTelemetryFeedEnabled(storeWith(true)), true);
@@ -439,23 +452,22 @@ test('a stream that goes quiet while accepted is requested again, at most once p
     startSession(t);
     readyForVirtual(t);
     const attitudeCommands = () => wireTraffic().commands.filter(([msgid]) => msgid === MAVLINK_MSG_ID.ATTITUDE);
-    const keepOthers = () => streamAll([MAVLINK_MSG_ID.ATTITUDE]);
+    // The FC answers each command at once but never sends ATTITUDE.
+    const run = (steps) => {
+        for (let i = 0; i < steps; i++) {
+            t.mock.timers.tick(250);
+            streamAll([MAVLINK_MSG_ID.ATTITUDE]);
+            if (!feed.streams.isIdle()) {
+                ack();
+            }
+        }
+    };
     assert.equal(attitudeCommands().length, 1);
-    for (let i = 0; i < 16; i++) {
-        t.mock.timers.tick(250);
-        keepOthers();
-    }
+    run(16);
     assert.equal(attitudeCommands().length, 2, 'asked again once ATTITUDE was older than 3 s');
-    ack();
-    for (let i = 0; i < 32; i++) {
-        t.mock.timers.tick(250);
-        keepOthers();
-    }
+    run(32);
     assert.equal(attitudeCommands().length, 2, 'not again within 10 s');
-    for (let i = 0; i < 12; i++) {
-        t.mock.timers.tick(250);
-        keepOthers();
-    }
+    run(12);
     assert.equal(attitudeCommands().length, 3);
     assert.equal(wireTraffic().commands.length, BASE_INTERVALS_US.size + 2, 'streaming ids are left alone');
 });
@@ -465,7 +477,7 @@ test('counters log per 10 s; stop(true) restores every interval one frame at a t
     readyForVirtual(t);
     feed.serve(MSPCodes.MSP_ATTITUDE, false, null, null);
     t.mock.timers.tick(STATS_PERIOD_MS);
-    const line = logs.find(entry => entry.startsWith('MAVLink telemetry A/B'));
+    const line = logs.find(entry => entry.startsWith('MAVLink telemetry, last'));
     assert.match(line, /wire 5 \(.*\), virtual 1 \(MSP_ATTITUDE 1\)/);
 
     const writes = wire.length;
@@ -499,4 +511,217 @@ test('restore gives up after 300 ms when the connection never reports a write', 
     const idle = new MavlinkTelemetryFeed({ link, send: () => {}, fc, msp: MSP, log: () => {} });
     idle.stop(false, () => closed++);
     assert.equal(closed, 2, 'no restore: done at once');
+});
+
+// --- bandwidth guard -------------------------------------------------------------------------------
+
+const STEP_MS = 50;
+const BASE_PERIODS_MS = new Map(Array.from(BASE_INTERVALS_US, ([msgid, us]) => [msgid, us / 1000]));
+
+function periodsWith(changes) {
+    const periods = new Map(BASE_PERIODS_MS);
+    changes.forEach((periodMs, msgid) => periods.set(msgid, periodMs));
+    return periods;
+}
+
+function mspCodesOf(write) {
+    const bytes = [];
+    for (const frame of new MavlinkParser().ingest(write)) {
+        if (frame.msgid === MAVLINK_MSG_ID.TUNNEL) {
+            bytes.push(...frame.payload.subarray(5, 5 + frame.payload[4]));
+        }
+    }
+    return bytes.length ? [bytes[4] | (bytes[5] << 8)] : [];
+}
+
+/*
+ * The FC side of a link for durationMs, in 50 ms steps: each message at its period (0 = silent),
+ * every interval command acknowledged (unless `acks` is false), every wire request answered.
+ * `poll` is read every step, `alive` sends a status read every 500 ms (tunnel replies arriving).
+ * During `fade` ([from, to) ms into the run) nothing reaches the Configurator.
+ */
+function runLink(t, durationMs, { periods, poll = null, alive = true, acks = true, fade = null, extra = () => [] }) {
+    let parsed = wire.length;
+    for (let elapsed = 0; elapsed < durationMs; elapsed += STEP_MS) {
+        t.mock.timers.tick(STEP_MS);
+        const now = Date.now();
+        const faded = fade !== null && elapsed >= fade[0] && elapsed < fade[1];
+        const frames = faded ? [] : [...periods].filter(([, periodMs]) => periodMs > 0 && now % periodMs === 0).map(([msgid]) => msgid);
+        [...frames, ...(faded ? [] : extra(now))].forEach(msgid => link.ingest(fcFrame(msgid)));
+        if (acks && !faded && !feed.streams.isIdle()) {
+            ack();
+        }
+        if (poll !== null) {
+            MSP.send_message(poll, false, false, null);
+        }
+        if (alive && now % 500 === 0) {
+            MSP.send_message(MSPCodes.MSP_SENSOR_STATUS, false, false, null);
+        }
+        mspQueue.executor();
+        for (; parsed < wire.length; parsed++) {
+            if (!faded) {
+                mspCodesOf(wire[parsed]).forEach(code => mspReply(code));
+            }
+        }
+    }
+}
+
+const commandsSince = before => wireTraffic().commands.slice(before);
+const reducedCommands = () => Array.from(REDUCED_INTERVALS_US, ([msgid, us]) => [msgid, us]);
+const attitudeAt = periodMs => periodsWith(new Map([[MAVLINK_MSG_ID.ATTITUDE, periodMs]]));
+const boostCommands = before => commandsSince(before).filter(([msgid, us]) => msgid === MAVLINK_MSG_ID.ATTITUDE && us === BOOST_INTERVAL_US);
+const ATTITUDE_BASE = [MAVLINK_MSG_ID.ATTITUDE, BASE_INTERVALS_US.get(MAVLINK_MSG_ID.ATTITUDE)];
+
+test('a boost runs at whatever the link delivers while polled, and nothing else changes', (t) => {
+    startSession(t);
+    readyForVirtual(t);
+    const before = wireTraffic().commands.length;
+    runLink(t, 20000, { periods: attitudeAt(150), poll: MSPCodes.MSP_ATTITUDE });
+    assert.deepEqual(commandsSince(before), [[MAVLINK_MSG_ID.ATTITUDE, BOOST_INTERVAL_US]], '6.7 Hz of 10, acknowledged: no further command');
+    assert.equal(feed.isBoosted(MAVLINK_MSG_ID.ATTITUDE), true);
+});
+
+test('a boost whose acks are all lost is sent again after 10 s, and its unboost still goes out', (t) => {
+    startSession(t);
+    readyForVirtual(t);
+    const before = wireTraffic().commands.length;
+    // 7 Hz: below the implicit-ack band, so the boost stays unconfirmed.
+    runLink(t, RE_REQUEST_MS + 2000, { periods: attitudeAt(150), poll: MSPCodes.MSP_ATTITUDE, acks: false });
+    assert.equal(boostCommands(before).length, 4, 'sent, resent, and asked again after 10 s');
+    assert.ok(logs.some(line => line.includes('interval for message 30 not confirmed, requested again')));
+    assert.equal(feed.streams.acceptedIntervalUs(MAVLINK_MSG_ID.ATTITUDE), ATTITUDE_BASE[1], 'sanity: still the base interval on record');
+
+    const polled = wireTraffic().commands.length;
+    runLink(t, 3000, { periods: attitudeAt(150), acks: false });
+    assert.deepEqual(commandsSince(polled).slice(0, 1), [ATTITUDE_BASE], 'the unboost is sent, although base is the accepted interval');
+
+    // Its acks are lost too: accepted equals requested again, but it is still unconfirmed.
+    runLink(t, 12000, { periods: attitudeAt(150), acks: false });
+    const unboosts = commandsSince(polled).filter(([msgid, us]) => msgid === ATTITUDE_BASE[0] && us === ATTITUDE_BASE[1]);
+    assert.equal(unboosts.length, 4, 'sent, resent, and asked again after 10 s');
+});
+
+test('a stream never confirmed is asked for again at most 6 times, 10 s apart, with one log line', (t) => {
+    startSession(t);
+    readyForVirtual(t);
+    const before = wireTraffic().commands.length;
+    runLink(t, 3000, { periods: attitudeAt(150), poll: MSPCodes.MSP_ATTITUDE, acks: false });
+    runLink(t, 120000, { periods: attitudeAt(150), poll: MSPCodes.MSP_ATTITUDE, acks: false, alive: false });
+    // Each re-request is one command with its own resend.
+    assert.equal(boostCommands(before).length, 2 * (1 + MAX_RE_REQUESTS));
+    assert.equal(logs.filter(line => line.includes('message 30 requested again ' + MAX_RE_REQUESTS + ' times')).length, 1);
+});
+
+test('an unboost whose acks are lost does not swallow the next boost', (t) => {
+    startSession(t);
+    readyForVirtual(t);
+    runLink(t, 1000, { periods: attitudeAt(100), poll: MSPCodes.MSP_ATTITUDE });
+    assert.equal(feed.streams.acceptedIntervalUs(MAVLINK_MSG_ID.ATTITUDE), BOOST_INTERVAL_US, 'sanity: boost acknowledged');
+    const before = wireTraffic().commands.length;
+    runLink(t, 4000, { periods: attitudeAt(500), acks: false });
+    assert.deepEqual(commandsSince(before).slice(0, 1), [ATTITUDE_BASE], 'sanity: unboosted');
+    const reboost = wireTraffic().commands.length;
+    runLink(t, 1000, { periods: attitudeAt(500), poll: MSPCodes.MSP_ATTITUDE });
+    assert.deepEqual(commandsSince(reboost).slice(0, 1), [[MAVLINK_MSG_ID.ATTITUDE, BOOST_INTERVAL_US]], 'the boost goes out, although it is the accepted interval');
+});
+
+test('an accepted stream never received is requested again twice, 10 s apart, then left alone', (t) => {
+    startSession(t);
+    answerCommands(t);
+    streamAll([MAVLINK_MSG_ID.GPS_RAW_INT]);
+    seedAll(t);
+    const before = wireTraffic().commands.length;
+    // No GPS: the FC accepts GPS_RAW_INT but never sends it.
+    runLink(t, 40000, { periods: periodsWith(new Map([[MAVLINK_MSG_ID.GPS_RAW_INT, 0]])) });
+    const gps = commandsSince(before).filter(([msgid]) => msgid === MAVLINK_MSG_ID.GPS_RAW_INT);
+    assert.equal(gps.length, NEVER_SEEN_RE_REQUESTS);
+    assert.equal(logs.filter(line => line.includes('message 24 never received, interval requested again')).length, NEVER_SEEN_RE_REQUESTS);
+});
+
+test('a slow serial start: freshness uses the reduced intervals, MSP_RC goes on the wire, analog does without RC_CHANNELS', (t) => {
+    startSession(t, { serialBaud: 4800 });
+    answerCommands(t);
+    assert.equal(feed.streams.isIdle(), true, 'sanity: the reduced set is acknowledged');
+
+    link.ingest(fcFrame(MAVLINK_MSG_ID.VFR_HUD));
+    feed.noteWireReply(MSPCodes.MSP_ALTITUDE);
+    t.mock.timers.tick(6000);
+    assert.equal(feed.serve(MSPCodes.MSP_ALTITUDE, false, null, null), true, 'VFR_HUD at 0.5 Hz: fresh for 3 x 2 s');
+    t.mock.timers.tick(1);
+    assert.equal(feed.serve(MSPCodes.MSP_ALTITUDE, false, null, null), false);
+
+    link.ingest(fcFrame(MAVLINK_MSG_ID.SYS_STATUS));
+    link.ingest(fcFrame(MAVLINK_MSG_ID.BATTERY_STATUS));
+    feed.noteWireReply(MSPCodes.MSPV2_INAV_ANALOG);
+    feed.noteWireReply(MSPCodes.MSP_RC);
+    assert.equal(feed.serve(MSPCodes.MSPV2_INAV_ANALOG, false, null, null), true, 'RC_CHANNELS is off: rssi from the wire refresh');
+    assert.equal(feed.serve(MSPCodes.MSP_RC, false, null, null), false);
+    assert.ok(logs.some(line => line.includes('MSP_RC goes over the tunnel (message 65 switched off)')));
+});
+
+test('a stream slowed down is judged at its new interval before the FC acknowledged it', (t) => {
+    startSession(t);
+    readyForVirtual(t);
+    feed.streams.setInterval(MAVLINK_MSG_ID.VFR_HUD, REDUCED_INTERVALS_US.get(MAVLINK_MSG_ID.VFR_HUD));
+    assert.equal(feed.streams.acceptedIntervalUs(MAVLINK_MSG_ID.VFR_HUD), BASE_INTERVALS_US.get(MAVLINK_MSG_ID.VFR_HUD), 'sanity: no ack yet');
+    link.ingest(fcFrame(MAVLINK_MSG_ID.VFR_HUD));
+    feed.noteWireReply(MSPCodes.MSP_ALTITUDE);
+    t.mock.timers.tick(5000);
+    assert.equal(feed.serve(MSPCodes.MSP_ALTITUDE, false, null, null), true, '3 x 2 s, not 3 x 0.5 s');
+});
+
+test('a slowdown whose acks are lost is not confirmed by the old rate and is requested again every 10 s', (t) => {
+    startSession(t);
+    readyForVirtual(t);
+    const before = wireTraffic().commands.length;
+    // 2 Hz -> 1 Hz and 1 Hz -> 0.5 Hz; the FC never applies them and keeps the old rates.
+    const slowdowns = [[MAVLINK_MSG_ID.SYS_STATUS, 1000000], [MAVLINK_MSG_ID.BATTERY_STATUS, 2000000]];
+    slowdowns.forEach(([msgid, us]) => feed.streams.setInterval(msgid, us));
+    runLink(t, 25000, { periods: BASE_PERIODS_MS, acks: false });
+    for (const [msgid, us] of slowdowns) {
+        assert.equal(feed.streams.acceptedIntervalUs(msgid), BASE_INTERVALS_US.get(msgid), `message ${msgid}: the old rate is no ack`);
+        const sent = commandsSince(before).filter(([id, interval]) => id === msgid && interval === us).length;
+        assert.ok(sent >= 4, `message ${msgid}: sent, resent, and asked again (${sent})`);
+        assert.ok(logs.some(line => line.includes('interval for message ' + msgid + ' not confirmed, requested again')));
+    }
+});
+
+test('an unboost whose acks are lost while the stream stays fast is requested again every 10 s', (t) => {
+    startSession(t);
+    readyForVirtual(t);
+    const before = wireTraffic().commands.length;
+    for (let i = 0; i < 3; i++) {
+        feed.serve(MSPCodes.MSP_ATTITUDE, false, null, null);
+    }
+    ack();
+    const unboost = [MAVLINK_MSG_ID.ATTITUDE, BASE_INTERVALS_US.get(MAVLINK_MSG_ID.ATTITUDE)];
+    // No more reads: unboost after 2 s, but the FC never gets it and keeps ATTITUDE at 10 Hz; no acks.
+    const unboosts = () => commandsSince(before).filter(([msgid, us]) => msgid === unboost[0] && us === unboost[1]).length;
+    runLink(t, 25000, { periods: new Map([[MAVLINK_MSG_ID.ATTITUDE, 100]]), alive: false, acks: false });
+    assert.equal(feed.streams.acceptedIntervalUs(MAVLINK_MSG_ID.ATTITUDE), BOOST_INTERVAL_US, 'the fast stream is no ack for the unboost');
+    assert.equal(unboosts(), 6, 'at about 2 s, 12 s and 22 s, each attempt resent once without an ack');
+    assert.ok(logs.some(line => line.includes('interval for message 30 not confirmed, requested again')));
+});
+
+test('a serial link at 9600 baud or less starts in the reduced set and never boosts', (t) => {
+    for (const [baud, reduced] of [[4800, true], [9600, true], [14400, false], [19200, false], [0, false]]) {
+        t.mock.timers.reset();
+        startSession(t, { serialBaud: baud });
+        answerCommands(t);
+        const expected = reduced ? reducedCommands() : Array.from(BASE_INTERVALS_US, ([msgid, us]) => [msgid, us]);
+        assert.deepEqual(wireTraffic().commands, expected, `baud ${baud}`);
+        assert.equal(feed.isReduced(), reduced, `baud ${baud}`);
+        assert.equal(logs.filter(line => line.includes('slow serial link')).length, reduced ? 1 : 0, `baud ${baud}`);
+    }
+
+    // 4800 baud: 20 Hz attitude reads served virtually never raise ATTITUDE above its reduced 1 Hz.
+    t.mock.timers.reset();
+    startSession(t, { serialBaud: 4800 });
+    answerCommands(t);
+    streamAll();
+    seedAll(t);
+    const before = wireTraffic().commands.length;
+    runLink(t, 15000, { periods: attitudeAt(1000), poll: MSPCodes.MSP_ATTITUDE });
+    assert.ok(feed.counts.virtual.get(MSPCodes.MSP_ATTITUDE) > 3, 'sanity: served virtually');
+    assert.equal(commandsSince(before).filter(([msgid]) => msgid === MAVLINK_MSG_ID.ATTITUDE).length, 0, 'no boost');
 });

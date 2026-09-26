@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * MSP queue tunnel mode: one request in flight, a 500 ms silence timeout restarted by every
- * received TUNNEL chunk, one whole-request retry (none for reboot), onFinish(false) at the end,
- * stale-reply watch and decoder reset. Runs the real js/serial_queue.js and js/msp.js (import
+ * MSP queue tunnel mode: one request in flight, a silence timeout (500 ms unless the link or
+ * late replies widen it) restarted by every received TUNNEL chunk, one whole-request retry (none
+ * for reboot), onFinish(false) at the end, stale-reply watch and decoder reset. Runs the real js/serial_queue.js and js/msp.js (import
  * specifiers rewritten only) with Node's mock timers; the FC side is the real MAVLink codec.
  *
  * processData below stands in for MSPHelper's completeRequest(): it fires and removes the
@@ -76,7 +76,11 @@ const link = new MavlinkLink({
         mspQueue.notifyTunnelProgress();
         MSP.read({ data: bytes });
     },
-    onReassemblyTimeout: () => MSP.resetDecoder(),
+    // Same wiring as js/serial_backend.js.
+    onReassemblyTimeout: () => {
+        MSP.resetDecoder();
+        mspQueue.discardTunnelChunks();
+    },
 });
 link.lockTarget(1, 1);
 
@@ -426,8 +430,15 @@ test('a code whose retry also lapsed is held for one silence window, and nothing
     assert.deepEqual(sentCodes().slice(2), [MSPCodes.MSP_FC_VARIANT], 'FIFO order is kept');
 });
 
-test('recovers after a loss burst: a 20 Hz same-code poller is back to normal within 1 s', (t) => {
+/*
+ * A lost reply holds the queue for one silence window, so recovery scales with the window:
+ * nothing created after the burst waits longer than one window, and two windows after it
+ * the poller is back to its round trip.
+ */
+function lossBurstRecovery(t, serialBaud) {
     startTunnelSession(t);
+    mspQueue.setTunnelMode(true, serialBaud);
+    const windowMs = mspQueue.getTunnelSilenceWindow();
     const FC_REPLY_MS = 2;
     const BURST_START = 1000;
     const BURST_END = 1300;
@@ -448,7 +459,8 @@ test('recovers after a loss burst: a 20 Hz same-code poller is back to normal wi
     const start = Date.now();
     const done = [];
     const roundtrips = [];
-    for (let now = 0; now < 3500; now += QUEUE_TICK_MS) {
+    const recovered = BURST_END + 2 * windowMs;
+    for (let now = 0; now < recovered + 1200; now += QUEUE_TICK_MS) {
         dropping = now >= BURST_START && now < BURST_END;
         if (now % 50 === 0) {
             const createdAt = Date.now() - start;
@@ -461,20 +473,201 @@ test('recovers after a loss burst: a 20 Hz same-code poller is back to normal wi
         roundtrips.push({ at: now, rt: mspQueue.getRoundtrip(), hw: mspQueue.getHardwareRoundtrip() });
     }
 
-    const recovered = BURST_END + 1000;
+    const afterBurst = done.filter((d) => d.createdAt >= BURST_END);
+    const slowest = Math.max(...afterBurst.map((d) => d.queuedToDone));
+    assert.ok(slowest <= windowMs + QUEUE_TICK_MS + FC_REPLY_MS, `queued->done after the burst ${slowest} ms, window ${windowMs} ms`);
+    assert.ok(afterBurst.every((d) => d.ok), 'the lost request was answered by its retry');
+
     const late = done.filter((d) => d.createdAt >= recovered);
     assert.ok(late.length >= 20, `sanity: the poller kept running (${late.length})`);
     const worst = Math.max(...late.map((d) => d.queuedToDone));
     assert.ok(worst <= QUEUE_TICK_MS + FC_REPLY_MS, `queued->done after recovery ${worst} ms`);
     // The poller is not held by it, but the watch lives while identical polls keep completing:
     // one of them may have taken the duplicate, making its own reply the outstanding one.
-    t.mock.timers.tick(2000);
+    t.mock.timers.tick(Math.max(2000, 2 * windowMs));
     assert.equal(mspQueue.isStaleWatched(MSPCodes.MSP_ATTITUDE), false, 'the watch ends once polling stops');
 
     const peak = Math.max(...roundtrips.map((r) => Math.max(r.rt, r.hw)));
     assert.ok(peak < 25, `no lost or held request feeds the round-trip average (peak ${peak.toFixed(1)} ms)`);
     const settled = roundtrips.filter((r) => r.at >= recovered);
     assert.ok(settled.every((r) => r.rt <= QUEUE_TICK_MS + FC_REPLY_MS + 5), 'round trip back at baseline');
+    assert.equal(mspQueue.getTunnelSilenceWindow(), windowMs, 'real losses do not widen the window');
+}
+
+test('recovers after a loss burst: a 20 Hz same-code poller is back to normal within two windows', (t) => {
+    lossBurstRecovery(t, 0);
+});
+
+test('recovers after a loss burst on a 4800 baud link within two of its wider windows', (t) => {
+    lossBurstRecovery(t, 4800);
+});
+
+/** A probe without retries lapses after one window; its reply lands latenessMs after it was sent. */
+function lateReplyAfterLapse(t, code, latenessMs) {
+    const windowMs = mspQueue.getTunnelSilenceWindow();
+    assert.ok(latenessMs > windowMs && latenessMs < 2 * windowMs, 'sanity: late, but inside the stale watch');
+    MSP.sendLinkProbe(code, () => {}, 0);
+    mspQueue.executor();
+    t.mock.timers.tick(latenessMs);
+    reply(code, [0x11]);
+    t.mock.timers.tick(QUEUE_TICK_MS);
+}
+
+test('the silence window starts from the drain time of a serial link', (t) => {
+    startTunnelSession(t);
+    const windowAt = (baud) => {
+        mspQueue.setTunnelMode(true, baud);
+        return mspQueue.getTunnelSilenceWindow();
+    };
+    assert.equal(windowAt(4800), 1158, '460 bytes at 480 B/s plus 200 ms');
+    assert.equal(windowAt(9600), 679);
+    assert.equal(windowAt(19200), 500, '440 ms, raised to the floor');
+    assert.equal(windowAt(115200), 500);
+    assert.equal(windowAt(0), 500, 'TCP, UDP and BLE: the link rate is unknown');
+    assert.equal(windowAt(1200), 3000, 'capped');
+    const slowPrior = (baud) => {
+        mspQueue.setTunnelMode(true, baud);
+        return [mspQueue.getTunnelSilencePrior(), mspQueue.hasSlowSerialPrior()];
+    };
+    assert.deepEqual(slowPrior(4800), [1158, true]);
+    assert.deepEqual(slowPrior(9600), [679, true]);
+    assert.deepEqual(slowPrior(14400), [519, false], 'a prior above the floor, but not a slow wire');
+    assert.deepEqual(slowPrior(19200), [500, false]);
+    assert.deepEqual(slowPrior(0), [500, false]);
+
+    mspQueue.setTunnelMode(true, 4800);
+    send(MSPCodes.MSP_FC_VARIANT);
+    mspQueue.executor();
+    t.mock.timers.tick(1157);
+    mspQueue.executor();
+    assert.equal(sent.length, 1, 'no retry inside the window');
+    t.mock.timers.tick(1);
+    mspQueue.executor();
+    assert.equal(sent.length, 2);
+});
+
+test('a reply 700 ms late widens the window, and the next same-code request is not retried early', (t) => {
+    startTunnelSession(t);
+    assert.equal(mspQueue.hasSlowSerialPrior(), false);
+    const results = [];
+    retryAnsweredByLateFirstReply(t, MSPCodes.MSP_FC_VARIANT, false, (response) => results.push(response));
+    assert.equal(sent.length, 2, 'sanity: the 500 ms window retried it');
+    t.mock.timers.tick(390); // t = 1100: the retry's own reply, 600 ms after the retry
+    reply(MSPCodes.MSP_FC_VARIANT, [0x11]);
+    assert.equal(mspQueue.getStaleReplyCount(), 1);
+    assert.equal(mspQueue.getTunnelSilenceWindow(), LINK_DELAY_MS * 1.5, 'the answer at 700 was attempt 1\'s: 1050, not 900');
+    assert.equal(mspQueue.hasSlowSerialPrior(), false, 'a learned window is no serial prior');
+
+    t.mock.timers.tick(QUEUE_TICK_MS);
+    send(MSPCodes.MSP_FC_VARIANT, (response) => results.push(response));
+    mspQueue.executor();
+    t.mock.timers.tick(LINK_DELAY_MS);
+    mspQueue.executor();
+    reply(MSPCodes.MSP_FC_VARIANT, [0x22]);
+    assert.equal(sent.length, 3, 'answered by its own reply, no retry');
+    assert.equal(results.length, 2);
+    assert.notEqual(results[1], false);
+});
+
+test('slow replies widen the window before anything lapses', (t) => {
+    startTunnelSession(t);
+    send(MSP_BOXNAMES);
+    mspQueue.executor();
+    const frames = fcReplyFrames(MSP_BOXNAMES, new Uint8Array(300).fill(0x41));
+    t.mock.timers.tick(300);
+    link.ingest(frames[0]);
+    t.mock.timers.tick(450);
+    link.ingest(frames[1]);
+    t.mock.timers.tick(100);
+    link.ingest(frames[2]);
+
+    assert.equal(sent.length, 1);
+    assert.equal(mspQueue.getTunnelSilenceWindow(), 675, '1.5 x the widest gap between chunks');
+});
+
+test('the learned window decays by 10 % per minute, and a real loss does not hold it', (t) => {
+    startTunnelSession(t);
+    lateReplyAfterLapse(t, MSPCodes.MSP_FC_VARIANT, 800); // t = 810, learned at 800
+    assert.equal(mspQueue.getTunnelSilenceWindow(), 1200);
+    t.mock.timers.tick(59989);
+    assert.equal(mspQueue.getTunnelSilenceWindow(), 1200);
+    t.mock.timers.tick(1);
+    assert.equal(mspQueue.getTunnelSilenceWindow(), 1080);
+    t.mock.timers.tick(60000);
+    assert.equal(mspQueue.getTunnelSilenceWindow(), 972);
+
+    t.mock.timers.tick(30000); // t = 150800
+    MSP.sendLinkProbe(MSPCodes.MSP_FC_VERSION, () => {}, 0);
+    mspQueue.executor();
+    t.mock.timers.tick(972); // lost: no reply ever, which says nothing about lateness
+    t.mock.timers.tick(29027);
+    assert.equal(mspQueue.getTunnelSilenceWindow(), 972);
+    t.mock.timers.tick(1); // t = 180800: the third minute since the late reply
+    assert.equal(mspQueue.getTunnelSilenceWindow(), 875);
+});
+
+test('the learned window never decays below the link prior and never exceeds 3 s', (t) => {
+    startTunnelSession(t);
+    mspQueue.setTunnelMode(true, 4800);
+    lateReplyAfterLapse(t, MSPCodes.MSP_FC_VARIANT, 1400);
+    assert.equal(mspQueue.getTunnelSilenceWindow(), 2100);
+    t.mock.timers.tick(10 * 60000);
+    assert.equal(mspQueue.getTunnelSilenceWindow(), 1158);
+
+    mspQueue.setTunnelMode(true, 0);
+    lateReplyAfterLapse(t, MSPCodes.MSP_FC_VARIANT, 900);
+    lateReplyAfterLapse(t, MSPCodes.MSP_FC_VARIANT, 2400);
+    assert.equal(mspQueue.getTunnelSilenceWindow(), 3000);
+    t.mock.timers.tick(60000);
+    assert.equal(mspQueue.getTunnelSilenceWindow(), 2700, 'stored at the cap: 3600 would still read 3000 here');
+});
+
+test('slow codes keep their 5 s first window, and their flash wait does not widen the window', (t) => {
+    startTunnelSession(t);
+    send(MSPCodes.MSP_EEPROM_WRITE);
+    mspQueue.executor();
+    t.mock.timers.tick(4000);
+    reply(MSPCodes.MSP_EEPROM_WRITE, []);
+    t.mock.timers.tick(QUEUE_TICK_MS);
+    assert.equal(mspQueue.getTunnelSilenceWindow(), SILENCE_MS, 'a 4 s flash erase is not link latency');
+
+    lateReplyAfterLapse(t, MSPCodes.MSP_FC_VARIANT, 900);
+    assert.equal(mspQueue.getTunnelSilenceWindow(), 1350);
+    send(MSPCodes.MSP_EEPROM_WRITE);
+    mspQueue.executor();
+    t.mock.timers.tick(SLOW_INITIAL_MS - 10);
+    mspQueue.executor();
+    assert.equal(sent.length, 3, 'still inside the 5 s window');
+    t.mock.timers.tick(10);
+    mspQueue.executor();
+    assert.equal(sent.length, 4, 'retried at 5 s, as before');
+});
+
+test('an abandoned EEPROM write that lapses at 5 s and then replies does not widen the window', (t) => {
+    startTunnelSession(t);
+    send(MSPCodes.MSP_EEPROM_WRITE);
+    mspQueue.executor();
+    MSP.callbacks_cleanup(); // tab switch: no retry
+    t.mock.timers.tick(SLOW_INITIAL_MS);
+    t.mock.timers.tick(300);
+    reply(MSPCodes.MSP_EEPROM_WRITE, []);
+    assert.equal(mspQueue.getStaleReplyCount(), 1, 'dropped as the lapsed write\'s late reply');
+    assert.equal(mspQueue.getTunnelSilenceWindow(), SILENCE_MS, '5.3 s of flash wait is not link latency');
+});
+
+test('a stray chunk before a flash write does not count the flash wait as a gap', (t) => {
+    startTunnelSession(t);
+    const results = [];
+    send(MSPCodes.MSP_EEPROM_WRITE, (response) => results.push(response));
+    mspQueue.executor();
+    t.mock.timers.tick(100);
+    link.ingest(fcReplyFrames(MSP_BOXNAMES, new Uint8Array(300).fill(0x41))[0]); // a partial foreign reply
+    t.mock.timers.tick(3900);
+    reply(MSPCodes.MSP_EEPROM_WRITE, []);
+
+    assert.equal(results.length, 1);
+    assert.notEqual(results[0], false);
+    assert.equal(mspQueue.getTunnelSilenceWindow(), SILENCE_MS);
 });
 
 test('a tab switch while a request is pending cannot lock the queue', (t) => {
@@ -510,6 +703,42 @@ test('a tab switch while a request is pending cannot lock the queue', (t) => {
     } finally {
         MSP.onResponseLost = null;
     }
+});
+
+test('a read identical to the request abandoned by a tab switch is not attached to it', (t) => {
+    startTunnelSession(t);
+    CONFIGURATOR.connectionValid = true;
+    const answers = [];
+    const readSetting = (index) => {
+        const sentOk = MSP.send_message(MSPCodes.MSPV2_SETTING, [0, index, 0], false, (response) => answers.push([index, response !== false]));
+        assert.equal(sentOk, true);
+    };
+    readSetting(5);
+    mspQueue.executor();
+
+    // gui.js tab_switch_cleanup()
+    MSP.callbacks_cleanup();
+    mspQueue.flush();
+    mspQueue.freeHardLock();
+    mspQueue.freeSoftLock();
+    mspDeduplicationQueue.flush();
+    answers.length = 0;
+
+    readSetting(9);
+    readSetting(5); // dedup refuses the put: same code as setting 9, same body as the abandoned read
+    reply(MSPCodes.MSPV2_SETTING, [42]); // the abandoned read's reply
+
+    let answered = sent.length;
+    for (let step = 0; step < 300 && answers.length < 2; step++) {
+        t.mock.timers.tick(QUEUE_TICK_MS);
+        mspQueue.executor();
+        if (sent.length > answered) {
+            answered = sent.length;
+            reply(MSPCodes.MSPV2_SETTING, [7]);
+        }
+    }
+    assert.deepEqual(answers, [[9, true], [5, true]], 'the new tab\'s second read is answered by its own request');
+    assert.equal(sent.length, 3);
 });
 
 test('lost replies are keyed by request payload: WP 4 read back does not unblock a lost WP 3', (t) => {

@@ -57,7 +57,10 @@ var SerialBackend = (function () {
         onHeartbeat: frame => privateScope.onMavlinkHeartbeat(frame),
         onTunnelChunk: bytes => privateScope.onTunnelChunk(bytes),
         onMessage: frame => privateScope.onMavlinkMessage(frame),
-        onReassemblyTimeout: () => MSP.resetDecoder(),
+        onReassemblyTimeout: () => {
+            MSP.resetDecoder();
+            mspQueue.discardTunnelChunks();
+        },
     });
     privateScope.telemetryFeed = null;
 
@@ -69,6 +72,7 @@ var SerialBackend = (function () {
         onBack: () => privateScope.onTunnelRebootBack(),
         onNotRebooted: () => privateScope.onTunnelRebootNotRebooted(),
         onGone: () => privateScope.onTunnelRebootGone(),
+        silenceWindowMs: () => mspQueue.getTunnelSilenceWindow(),
         log: (key, args) => GUI.log(i18n.getMessage(key, args)),
     });
     privateScope.tunnelRebootModal = null;
@@ -728,7 +732,13 @@ var SerialBackend = (function () {
         MSP.resetDecoder();
         mspQueue.freeHardLock();
         mspQueue.freeSoftLock();
-        mspQueue.setTunnelMode(true);
+        mspQueue.setTunnelMode(true, privateScope.tunnelSerialBaud());
+    };
+
+    // TCP, UDP and BLE report a nominal 115200 whatever radio link sits behind them.
+    privateScope.tunnelSerialBaud = function () {
+        const connection = CONFIGURATOR.connection;
+        return connection && connection.type === ConnectionType.Serial ? connection.bitrate : 0;
     };
 
     privateScope.sendTunnelHandshake = function () {
@@ -794,7 +804,7 @@ var SerialBackend = (function () {
     };
 
     privateScope.wrapForTunnel = function (body) {
-        // phase-2 A/B: wire counter.
+        // Counts wire requests for the feed's 10 s diagnostic line.
         if (privateScope.telemetryFeed) {
             privateScope.telemetryFeed.noteWire(mspCodeOfFrame(body));
         }
@@ -812,7 +822,7 @@ var SerialBackend = (function () {
     };
 
     privateScope.startTelemetryFeed = function () {
-        // phase-2 A/B: read once per connect; false keeps the whole session on phase-1 behaviour.
+        // Read once per connect; off keeps the whole session on MSP polling.
         CONFIGURATOR.mavlinkTelemetryFeed = CONFIGURATOR.mavlinkTunnelActive && isTelemetryFeedEnabled(store);
         periodicStatusUpdater.resetTunnelCycle();
         if (!CONFIGURATOR.mavlinkTelemetryFeed) {
@@ -827,6 +837,7 @@ var SerialBackend = (function () {
             onSensorStatus: status => privateScope.sensor_status_ex(status),
             onStreamsReady: privateScope.onTelemetryStreamsReady,
             onFirstVirtual: () => privateScope.showLinkType(true, true),
+            slowSerialLink: mspQueue.hasSlowSerialPrior(),
         });
         MSP.virtualReplies = privateScope.telemetryFeed;
         privateScope.telemetryFeed.start();

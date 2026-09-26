@@ -6,7 +6,7 @@ import CONFIGURATOR from './data_storage';
 import MSP from './msp';
 import MSPCodes from './msp/MSPCodes';
 
-// The FC's isMspConfigActive() lapses 1000 ms after the last MSP_SENSOR_STATUS, so a telemetry-fed tunnel polls it at 2 Hz.
+// The FC's isMspConfigActive() lapses 1000 ms after the last MSP_SENSOR_STATUS, so a tunnel polls it at 2 Hz.
 const TUNNEL_SENSOR_STATUS_INTERVAL_MS = 500;
 const TUNNEL_STATUS_INTERVAL_MS = 1000;
 
@@ -26,8 +26,7 @@ const TUNNEL_STATUS_INTERVAL_MS = 1000;
     publicScope.getUpdateInterval = function (baudSpeed) {
 
         if (CONFIGURATOR.mavlinkTunnelActive) {
-            // phase-2 A/B: without the telemetry feed the tunnel keeps phase 1's single 1 Hz run.
-            return CONFIGURATOR.mavlinkTelemetryFeed ? TUNNEL_SENSOR_STATUS_INTERVAL_MS : TUNNEL_STATUS_INTERVAL_MS;
+            return TUNNEL_SENSOR_STATUS_INTERVAL_MS;
         }
 
         if (!baudSpeed) {
@@ -104,8 +103,7 @@ const TUNNEL_STATUS_INTERVAL_MS = 1000;
 
     // Only every second tunnel run polls the rest, which keeps them at 1 Hz.
     privateScope.skipSlowStatus = function () {
-        // phase-2 A/B: gated on the feed flag.
-        if (!CONFIGURATOR.mavlinkTunnelActive || !CONFIGURATOR.mavlinkTelemetryFeed) {
+        if (!CONFIGURATOR.mavlinkTunnelActive) {
             return false;
         }
         tunnelRunCount = (tunnelRunCount + 1) % (TUNNEL_STATUS_INTERVAL_MS / TUNNEL_SENSOR_STATUS_INTERVAL_MS);

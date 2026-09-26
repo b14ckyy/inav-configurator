@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * Status polling: a plain MSP link keeps its four requests per run; a MAVLink tunnel with the
- * telemetry feed polls MSP_SENSOR_STATUS every 500 ms (the FC's isMspConfigActive() window is
- * 1000 ms) and the other two every second run; with the feed off (A/B) the tunnel keeps
- * phase 1's single 1 Hz run. A tunnel never polls MSP_ACTIVEBOXES: MSPV2_INAV_STATUS carries
- * the same box bitmask. Runs the real js/periodicStatusUpdater.js with stubbed imports.
+ * Status polling: a plain MSP link keeps its four requests per run; a MAVLink tunnel, with or
+ * without the telemetry feed, polls MSP_SENSOR_STATUS every 500 ms (the FC's isMspConfigActive()
+ * window is 1000 ms) and the other two every second run. A tunnel never polls MSP_ACTIVEBOXES:
+ * MSPV2_INAV_STATUS carries the same box bitmask. Runs the real js/periodicStatusUpdater.js
+ * with stubbed imports.
  */
 
 import { test } from 'node:test';
@@ -46,9 +46,9 @@ test('plain MSP: every run sends all four requests at the baud-rate interval', (
     assert.equal(periodicStatusUpdater.getUpdateInterval(115200), 300);
 });
 
-test('tunnel with the telemetry feed: MSP_SENSOR_STATUS at 2 Hz, STATUS and ANALOG at 1 Hz, no ACTIVEBOXES', () => {
+function tunnelCadence(feed) {
     configurator.mavlinkTunnelActive = true;
-    configurator.mavlinkTelemetryFeed = true;
+    configurator.mavlinkTelemetryFeed = feed;
     periodicStatusUpdater.resetTunnelCycle();
     sent.length = 0;
     assert.equal(periodicStatusUpdater.getUpdateInterval(115200), 500);
@@ -65,17 +65,12 @@ test('tunnel with the telemetry feed: MSP_SENSOR_STATUS at 2 Hz, STATUS and ANAL
     assert.deepEqual(sent, TUNNEL);
     configurator.mavlinkTunnelActive = false;
     configurator.mavlinkTelemetryFeed = false;
+}
+
+test('tunnel with the telemetry feed: MSP_SENSOR_STATUS at 2 Hz, STATUS and ANALOG at 1 Hz, no ACTIVEBOXES', () => {
+    tunnelCadence(true);
 });
 
-test('tunnel with the feed off (A/B): one run every 1000 ms, no ACTIVEBOXES', () => {
-    configurator.mavlinkTunnelActive = true;
-    configurator.mavlinkTelemetryFeed = false;
-    periodicStatusUpdater.resetTunnelCycle();
-    sent.length = 0;
-    assert.equal(periodicStatusUpdater.getUpdateInterval(115200), 1000);
-    for (let i = 0; i < 3; i++) {
-        periodicStatusUpdater.run();
-    }
-    assert.deepEqual(sent, [...TUNNEL, ...TUNNEL, ...TUNNEL]);
-    configurator.mavlinkTunnelActive = false;
+test('tunnel with the feed switched off: the same cadence, the FC must still see MSP_SENSOR_STATUS at 2 Hz', () => {
+    tunnelCadence(false);
 });

@@ -17,6 +17,8 @@ export const TELEMETRY_COVERED = new Map([
 
 const TWO_HZ_US = 500000;
 const ONE_HZ_US = 1000000;
+const HALF_HZ_US = 2000000;
+const STREAM_OFF = -1;
 // Requested explicitly: a MAVLink port with index > 0 streams only HEARTBEAT by default.
 export const BASE_INTERVALS_US = new Map([
     [MAVLINK_MSG_ID.SYS_STATUS, TWO_HZ_US],
@@ -25,6 +27,17 @@ export const BASE_INTERVALS_US = new Map([
     [MAVLINK_MSG_ID.GPS_RAW_INT, TWO_HZ_US],
     [MAVLINK_MSG_ID.BATTERY_STATUS, ONE_HZ_US],
     [MAVLINK_MSG_ID.RC_CHANNELS, ONE_HZ_US],
+]);
+
+// For a serial wire at 9600 baud or less, from the start (measured at 4800: the base set crowded out MSP replies).
+// MSP_RC then goes on the wire.
+export const REDUCED_INTERVALS_US = new Map([
+    [MAVLINK_MSG_ID.SYS_STATUS, ONE_HZ_US],
+    [MAVLINK_MSG_ID.ATTITUDE, ONE_HZ_US],
+    [MAVLINK_MSG_ID.VFR_HUD, HALF_HZ_US],
+    [MAVLINK_MSG_ID.GPS_RAW_INT, ONE_HZ_US],
+    [MAVLINK_MSG_ID.BATTERY_STATUS, HALF_HZ_US],
+    [MAVLINK_MSG_ID.RC_CHANNELS, STREAM_OFF],
 ]);
 
 export const BOOST_INTERVAL_US = 100000;
@@ -43,11 +56,15 @@ export const STATS_PERIOD_MS = 10000;
 export const WIRE_REFRESH_MS = 10000;
 // An FC reboot drops every interval override; a stream gone quiet is asked for again, but not more often than this.
 export const RE_REQUEST_MS = 10000;
+// An accepted stream never received may be one the FC does not send (GPS_RAW_INT without a GPS): ask twice, then stop.
+export const NEVER_SEEN_RE_REQUESTS = 2;
+// A quiet or unconfirmed stream is asked for again once per 10 s for a minute, then left alone.
+export const MAX_RE_REQUESTS = 6;
 // The FC reads one MAVLink message per cycle out of a 64 byte budget: restore commands go out one by one.
 export const RESTORE_SPACING_MS = 20;
 export const RESTORE_DEADLINE_MS = 300;
 
-// phase-2 A/B: 'mavlink_telemetry_feed' = false in the store keeps a tunnel session on pure MSP polling.
+// 'mavlink_telemetry_feed' = false in the store keeps a tunnel session on pure MSP polling.
 export function isTelemetryFeedEnabled(store) {
     return store.get('mavlink_telemetry_feed', true) !== false;
 }
@@ -76,6 +93,7 @@ export class MavlinkTelemetryFeed {
         this._log = options.log || (line => console.log(line));
         this._onStreamsReady = options.onStreamsReady || null;
         this._onFirstVirtual = options.onFirstVirtual || null;
+        this._slowSerialLink = options.slowSerialLink === true;
         this.telemetry = new MavlinkTelemetry({
             fc: options.fc,
             msp: options.msp,
@@ -90,23 +108,29 @@ export class MavlinkTelemetryFeed {
             roundTripMs: options.roundTripMs,
         });
         this._lastReRequest = new Map();
+        this._neverSeenReRequests = new Map();
+        this._reRequestCount = new Map();
         this._recentRequests = new Map();
         this._boosted = new Set();
+        this._baseIntervals = BASE_INTERVALS_US;
         this._lastWireAt = new Map();
         this._fallbackLogged = new Set();
         this._pendingCallbacks = new Set();
         this._streamsReady = false;
         this._servedVirtually = false;
         this._timers = [];
-        // phase-2 A/B: counts.
         this.resetCounts();
     }
 
     start() {
-        this.streams.requestBase(BASE_INTERVALS_US, (accepted, total) => this._streamsDone(accepted, total));
+        if (this._slowSerialLink) {
+            this._baseIntervals = REDUCED_INTERVALS_US;
+            this._log('MAVLink telemetry: slow serial link, reduced telemetry set without boost');
+        }
+        this.streams.requestBase(this._baseIntervals, (accepted, total) => this._streamsDone(accepted, total));
         this._timers.push(
             setInterval(() => this._checkStreams(), IDLE_CHECK_MS),
-            // phase-2 A/B: wire vs virtual counter on the console.
+            // Diagnostic: wire vs virtual counts on the console.
             setInterval(() => this._logCounts(), STATS_PERIOD_MS),
         );
     }
@@ -138,7 +162,6 @@ export class MavlinkTelemetryFeed {
             this._logFallback(code, reason);
             return false;
         }
-        // phase-2 A/B: counts.
         countInto(this.counts.virtual, code);
         this._noteBoostRequest(code);
         this._scheduleCallbacks(onSent, onFinish);
@@ -151,7 +174,7 @@ export class MavlinkTelemetryFeed {
         return true;
     }
 
-    // phase-2 A/B: counts tunnel attempts on the wire.
+    // Counts tunnel attempts on the wire for the diagnostic line.
     noteWire(code) {
         countInto(this.counts.wire, code);
     }
@@ -169,13 +192,16 @@ export class MavlinkTelemetryFeed {
         this._pendingCallbacks.clear();
     }
 
-    // phase-2 A/B: wire vs virtual counter.
     resetCounts() {
         this.counts = { wire: new Map(), virtual: new Map(), since: this._now() };
     }
 
     isBoosted(msgid) {
         return this._boosted.has(msgid);
+    }
+
+    isReduced() {
+        return this._baseIntervals === REDUCED_INTERVALS_US;
     }
 
     _intervalFrame(msgid, intervalUs) {
@@ -207,17 +233,40 @@ export class MavlinkTelemetryFeed {
         if (code === MSPCodes.MSP_RC && this.telemetry.rcChannelsTruncated) {
             return 'more than 18 RC channels';
         }
-        for (const msgid of sources) {
-            const intervalUs = this.streams.acceptedIntervalUs(msgid);
-            const acknowledged = intervalUs > 0;
-            if (!acknowledged) {
-                return 'interval for message ' + msgid + ' not acknowledged';
-            }
-            if (!this.telemetry.seenWithin(msgid, freshWindowMs(intervalUs))) {
-                return 'message ' + msgid + (this.telemetry.lastSeen.has(msgid) ? ' is stale' : ' never received');
+        // A stream switched off is optional where the code has other sources (rssi of MSPV2_INAV_ANALOG).
+        const active = sources.filter(msgid => !this._isOff(msgid));
+        if (active.length === 0) {
+            return 'message ' + sources.join('/') + ' switched off';
+        }
+        for (const msgid of active) {
+            const reason = this._sourceReason(msgid);
+            if (reason) {
+                return reason;
             }
         }
         return null;
+    }
+
+    _sourceReason(msgid) {
+        const accepted = this.streams.acceptedIntervalUs(msgid);
+        if (accepted === undefined || accepted <= 0) {
+            return 'interval for message ' + msgid + ' not acknowledged';
+        }
+        if (!this.telemetry.seenWithin(msgid, this._freshWindowFor(msgid))) {
+            return 'message ' + msgid + (this.telemetry.lastSeen.has(msgid) ? ' is stale' : ' never received');
+        }
+        return null;
+    }
+
+    _isOff(msgid) {
+        return this.streams.requestedIntervalUs(msgid) < 0;
+    }
+
+    // The slower of accepted and requested: a stream just slowed down is not stale at its new rate.
+    _freshWindowFor(msgid) {
+        const accepted = this.streams.acceptedIntervalUs(msgid) ?? 0;
+        const requested = this.streams.requestedIntervalUs(msgid) ?? 0;
+        return freshWindowMs(Math.max(accepted, requested));
     }
 
     _logFallback(code, reason) {
@@ -250,29 +299,85 @@ export class MavlinkTelemetryFeed {
         const recent = (this._recentRequests.get(msgid) || []).filter(at => now - at < BOOST_WINDOW_MS);
         recent.push(now);
         this._recentRequests.set(msgid, recent);
-        if (recent.length >= BOOST_REQUESTS && !this._boosted.has(msgid)) {
+        if (recent.length >= BOOST_REQUESTS && !this._boosted.has(msgid) && this._mayBoost(msgid)) {
             this._boosted.add(msgid);
             this.streams.setInterval(msgid, BOOST_INTERVAL_US);
         }
     }
 
+    // A slow serial link never boosts; neither does a stream switched off in its base set.
+    _mayBoost(msgid) {
+        return !this._slowSerialLink && this._baseIntervals.get(msgid) > 0;
+    }
+
     _checkStreams() {
         this._unboostIdle();
         this._reRequestStale();
+        this._reRequestUnconfirmed();
     }
 
+    // An FC reboot drops every override; an ack may also belong to another command (it names no message id).
     _reRequestStale() {
         const now = this._now();
-        for (const msgid of BASE_INTERVALS_US.keys()) {
-            const intervalUs = this.streams.acceptedIntervalUs(msgid);
-            const quiet = intervalUs > 0 && this.telemetry.lastSeen.has(msgid) &&
-                !this.telemetry.seenWithin(msgid, freshWindowMs(intervalUs));
-            const recentlyAsked = now - (this._lastReRequest.get(msgid) ?? -Infinity) < RE_REQUEST_MS;
-            if (quiet && !recentlyAsked && this.streams.reRequest(msgid)) {
-                this._lastReRequest.set(msgid, now);
-                this._log('MAVLink telemetry: message ' + msgid + ' went quiet, interval requested again');
+        for (const msgid of this._baseIntervals.keys()) {
+            const neverSeen = !this.telemetry.lastSeen.has(msgid);
+            const exhausted = neverSeen && (this._neverSeenReRequests.get(msgid) || 0) >= NEVER_SEEN_RE_REQUESTS;
+            if (exhausted || !this._isQuiet(msgid, now) || !this._reRequest(msgid, now)) {
+                continue;
+            }
+            if (neverSeen) {
+                this._neverSeenReRequests.set(msgid, (this._neverSeenReRequests.get(msgid) || 0) + 1);
+            }
+            this._log('MAVLink telemetry: message ' + msgid + (neverSeen ? ' never received' : ' went quiet') +
+                ', interval requested again');
+        }
+    }
+
+    // Accepted, but not seen within its fresh window: since then, or since the command went out.
+    _isQuiet(msgid, now) {
+        const accepted = this.streams.acceptedIntervalUs(msgid);
+        if (accepted === undefined || accepted <= 0 || this._isOff(msgid)) {
+            return false;
+        }
+        const windowMs = this._freshWindowFor(msgid);
+        if (this.telemetry.lastSeen.has(msgid)) {
+            return !this.telemetry.seenWithin(msgid, windowMs);
+        }
+        const sentAt = this.streams.sentAt(msgid);
+        return accepted === this.streams.requestedIntervalUs(msgid) && sentAt !== null && now - sentAt >= windowMs;
+    }
+
+    // The stream control gives up after two unanswered attempts, and a slowdown (unboost) is confirmed by
+    // its ack only: an unboost that never arrived leaves the stream fast. A boost can be confirmed by its rate.
+    _reRequestUnconfirmed() {
+        const now = this._now();
+        for (const msgid of this._baseIntervals.keys()) {
+            const requested = this.streams.requestedIntervalUs(msgid);
+            const sentAt = this.streams.sentAt(msgid);
+            const unacknowledged = this.streams.acceptedIntervalUs(msgid) !== requested || this.streams.isUnconfirmed(msgid);
+            const unconfirmed = requested !== undefined && sentAt !== null && now - sentAt >= RE_REQUEST_MS &&
+                unacknowledged && !this.streams.isRefused(msgid);
+            if (unconfirmed && this._reRequest(msgid, now)) {
+                this._log('MAVLink telemetry: interval for message ' + msgid + ' not confirmed, requested again');
             }
         }
+    }
+
+    _reRequest(msgid, now) {
+        const count = this._reRequestCount.get(msgid) || 0;
+        if (count >= MAX_RE_REQUESTS) {
+            return false;
+        }
+        if (now - (this._lastReRequest.get(msgid) ?? -Infinity) < RE_REQUEST_MS || !this.streams.reRequest(msgid)) {
+            return false;
+        }
+        this._lastReRequest.set(msgid, now);
+        this._reRequestCount.set(msgid, count + 1);
+        if (count + 1 === MAX_RE_REQUESTS) {
+            this._log('MAVLink telemetry: message ' + msgid + ' requested again ' + MAX_RE_REQUESTS +
+                ' times, no more for this session');
+        }
+        return true;
     }
 
     _sendRestore(frames, done) {
@@ -308,7 +413,7 @@ export class MavlinkTelemetryFeed {
             const last = recent.length > 0 ? recent[recent.length - 1] : -Infinity;
             if (now - last >= UNBOOST_IDLE_MS) {
                 this._boosted.delete(msgid);
-                this.streams.setInterval(msgid, BASE_INTERVALS_US.get(msgid));
+                this.streams.setInterval(msgid, this._baseIntervals.get(msgid));
             }
         });
     }
@@ -317,7 +422,7 @@ export class MavlinkTelemetryFeed {
         return this._msp.getCodeName ? this._msp.getCodeName(code) : String(code);
     }
 
-    // phase-2 A/B: formatting and logging of the wire vs virtual counter.
+    // Diagnostic line: which covered reads went on the wire and which were answered from telemetry.
     _formatCounts(map) {
         let total = 0;
         const parts = [];
@@ -330,7 +435,7 @@ export class MavlinkTelemetryFeed {
 
     _logCounts() {
         const seconds = Math.round((this._now() - this.counts.since) / 1000);
-        this._log('MAVLink telemetry A/B, last ' + seconds + ' s: wire ' + this._formatCounts(this.counts.wire) +
+        this._log('MAVLink telemetry, last ' + seconds + ' s: wire ' + this._formatCounts(this.counts.wire) +
             ', virtual ' + this._formatCounts(this.counts.virtual));
         this.resetCounts();
     }

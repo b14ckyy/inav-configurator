@@ -19,7 +19,6 @@ import {
     TunnelRebootMonitor,
     REBOOT_BACK_TIMEOUT_MS,
     REBOOT_REPLY_WATCHDOG_MS,
-    REBOOT_UPTIME_WATCHDOG_MS,
 } from '../js/mavlink/tunnelRebootMonitor.js';
 import { dataModule } from './helpers/dataModule.mjs';
 import { loadMspHelper, mspV2Reply, resetMspCore } from './helpers/mspCore.mjs';
@@ -198,11 +197,11 @@ class FakeFc {
     }
 }
 
-function startSession(t, fcOptions) {
+function startSession(t, fcOptions, serialBaud = 0) {
     resetMspCore({ MSP, mspQueue, mspDeduplicationQueue, CONFIGURATOR });
 
     t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 1000000 });
-    mspQueue.setTunnelMode(true);
+    mspQueue.setTunnelMode(true, serialBaud);
     mspQueue.setTransportTransform((body) => concatFrames(link.wrapMsp(body)).buffer, () => link.resetReassembly());
 
     const session = { outcomes: [], logs: [], uptimes: [], started: 0, callerReplies: 0 };
@@ -215,6 +214,7 @@ function startSession(t, fcOptions) {
         onBack: () => session.outcomes.push('back'),
         onNotRebooted: () => session.outcomes.push('notRebooted'),
         onGone: () => session.outcomes.push('gone'),
+        silenceWindowMs: () => mspQueue.getTunnelSilenceWindow(),
         log: (key, args) => {
             session.logs.push(key);
             if (args) {
@@ -378,6 +378,35 @@ test('request lost twice: one resend only, then not rebooted', (t) => {
     assert.equal(session.callerReplies, 0);
 });
 
+// --- a wide silence window (2000 baud: 2500 ms, 2400 baud: 2117 ms) ----------------------------------
+
+test('2000 baud, fast reboot after the reply: the uptime read waits out held and lost reads, then says back', (t) => {
+    // The first probe hits the rebooting FC and lapses after one window; the next is held for one more,
+    // and the first MSP2_INAV_MISC2 attempt is lost: the uptime answer comes 4 s after the read started,
+    // past a fixed 3 s watchdog (which would read "not rebooted": no silence was seen).
+    const session = startSession(t, { rebootMs: 300, dropMisc2: 1 }, 2000);
+    assert.equal(mspQueue.getTunnelSilenceWindow(), 2500);
+    sendReboot(session);
+    advance(t, 10000);
+    assert.equal(session.logs.includes('mavlinkTunnelRebootSilent'), false, 'too short to be seen');
+    assert.equal(session.logs.includes('mavlinkTunnelRebootUptimeUnavailable'), false);
+    assert.deepEqual(session.logs.slice(-2), [UPTIME, 'mavlinkTunnelRebootBack']);
+    assert.deepEqual(session.outcomes, ['back']);
+    assert.equal(fc.uptimeReads, 2);
+    assert.equal(fc.reboots, 1);
+});
+
+test('2400 baud, request lost: the uptime proves it, the reboot is sent exactly once more', (t) => {
+    const session = startSession(t, { rebootMs: 2000, dropRequests: 1 }, 2400);
+    sendReboot(session);
+    advance(t, 18000);
+    assert.equal(fc.rebootRequests, 2);
+    assert.deepEqual(session.logs.slice(0, 4), ['mavlinkTunnelRebootReplyLost', UPTIME, 'mavlinkTunnelRebootResend', 'mavlinkTunnelRebootWaiting']);
+    assert.deepEqual(session.outcomes, ['back']);
+    assert.equal(fc.reboots, 1);
+    assert.equal(session.callerReplies, 1);
+});
+
 // --- uptime unavailable: never a resend without a positive reading --------------------------------
 
 test('MSP2_INAV_MISC2 lost twice after a silent reboot: the silence verdict stands', (t) => {
@@ -432,7 +461,7 @@ test('an abandoned reboot request (no callback ever) is treated as lost after 10
     assert.deepEqual(session.outcomes, ['back']);
 });
 
-test('an uptime read that never calls back ends after 3 s like an unreadable one', (t) => {
+test('an uptime read that never calls back ends after 3 windows + margin (3 s) like an unreadable one', (t) => {
     const session = startSession(t, { rebootMs: 2000 });
     const readUptime = monitor.deps.readUptime;
     let reads = 0;
@@ -446,7 +475,8 @@ test('an uptime read that never calls back ends after 3 s like an unreadable one
     advance(t, 3000);
     assert.equal(reads, 1);
     assert.deepEqual(session.outcomes, []);
-    advance(t, REBOOT_UPTIME_WATCHDOG_MS);
+    assert.equal(monitor.uptimeWatchdogMs(), 3000);
+    advance(t, monitor.uptimeWatchdogMs());
     assert.ok(session.logs.includes('mavlinkTunnelRebootUptimeUnavailable'));
     assert.deepEqual(session.outcomes, ['back'], 'the silence verdict stands');
 });

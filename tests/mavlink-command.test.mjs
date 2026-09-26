@@ -16,7 +16,12 @@ import {
     encodeCommandLongPayload,
     decodeCommandAck,
 } from '../js/mavlink/mavlinkProtocol.js';
-import { MavlinkStreamControl, COMMAND_SPACING_MS, COMMAND_ACK_TIMEOUT_MS, IMPLICIT_ACK_WINDOW_MS } from '../js/mavlink/mavlinkStreamControl.js';
+import {
+    MavlinkStreamControl,
+    COMMAND_SPACING_MS,
+    COMMAND_ACK_TIMEOUT_MS,
+    IMPLICIT_ACK_WINDOW_MS,
+} from '../js/mavlink/mavlinkStreamControl.js';
 
 const GOLDEN = {
     cmd_attitude_10hz_seq5: 'fd20000005fd194c00000000f0410050c3470000000000000000000000000000000000000000ff0101017227',
@@ -189,10 +194,13 @@ test('ack timeout scales with the tunnel round trip, 500 ms minimum', (t) => {
     t.mock.timers.tick(1);
     t.mock.timers.tick(COMMAND_SPACING_MS);
     assert.equal(sent.length, 2, 'resent after 1200 ms');
-    control.handleAck(ACK);
     roundTrip = 10;
+    control.handleAck(ACK); // answered only after the resend: the next command waits one ack timeout
     control.setInterval(65, 1000000);
-    t.mock.timers.tick(COMMAND_SPACING_MS);
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS - 1);
+    assert.equal(sent.length, 2, 'a late duplicate ack for 30 may still come');
+    t.mock.timers.tick(1);
+    assert.equal(sent.length, 3);
     t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS);
     t.mock.timers.tick(COMMAND_SPACING_MS);
     assert.equal(sent.length, 4, 'fast link: 500 ms floor');
@@ -205,7 +213,7 @@ test('a timed-out command is dropped, not duplicated, when a newer one for its i
     control.requestBase(new Map([[30, 500000]]), (accepted, total) => { done = [accepted, total]; });
     control.setInterval(30, 100000);            // queued behind the one in flight
     t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS);
-    t.mock.timers.tick(COMMAND_SPACING_MS);
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS);  // after a timeout the next command waits one ack timeout
     assert.deepEqual(sent, [[30, 500000], [30, 100000]]);
     control.handleAck(ACK);
     t.mock.timers.tick(COMMAND_SPACING_MS * 20);
@@ -224,4 +232,156 @@ test('reRequest sends the current interval again, but not while one is pending',
     assert.equal(control.reRequest(30), true);
     assert.deepEqual(sent, [[30, 500000], [30, 500000]]);
     assert.equal(control.reRequest(65), false, 'never requested');
+});
+
+test('sentAt: null while queued, the first transmit (not the resend), or now when already in effect', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1000 });
+    const { control, sent } = makeControl();
+    control.setInterval(30, 500000);
+    control.setInterval(65, 1000000);
+    assert.equal(control.sentAt(30), 1000);
+    assert.equal(control.sentAt(65), null, 'queued behind the command in flight');
+    assert.equal(control.sentAt(24), null, 'never requested');
+
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS);
+    t.mock.timers.tick(COMMAND_SPACING_MS);
+    assert.deepEqual(sent, [[30, 500000], [30, 500000]]);
+    assert.equal(control.sentAt(30), 1000, 'the resend keeps the first send time');
+    control.handleAck(ACK);
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS);
+    assert.equal(control.sentAt(65), Date.now());
+    control.handleAck(ACK);
+
+    t.mock.timers.tick(1000);
+    control.setInterval(65, 200000);
+    control.setInterval(30, 100000);
+    assert.equal(control.sentAt(30), null, 'a new interval restarts the clock');
+    t.mock.timers.tick(200);
+    control.setInterval(30, 500000); // withdrawn before it went out: the accepted interval stays
+    assert.equal(control.sentAt(30), Date.now());
+    assert.equal(control.requestedIntervalUs(30), 500000);
+    control.handleAck(ACK);
+    t.mock.timers.tick(COMMAND_SPACING_MS * 4);
+    assert.deepEqual(sent.slice(-1), [[65, 200000]], 'nothing sent for 30');
+});
+
+test('isRefused holds for the refused interval only', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1000 });
+    const { control } = makeControl();
+    control.setInterval(30, 100000);
+    control.handleAck(NACK);
+    assert.equal(control.isRefused(30), true);
+    t.mock.timers.tick(COMMAND_SPACING_MS);
+    control.setInterval(30, 500000);
+    assert.equal(control.isRefused(30), false);
+    control.handleAck(ACK);
+    assert.equal(control.isRefused(30), false);
+});
+
+test('a slowdown is never acknowledged by frames: 2 Hz -> 1 Hz and 1 Hz -> 0.5 Hz wait for the explicit ack', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1000 });
+    for (const [fromUs, toUs] of [[500000, 1000000], [1000000, 2000000]]) {
+        const { control, sent } = makeControl();
+        control.setInterval(30, fromUs);
+        control.handleAck(ACK);
+        t.mock.timers.tick(COMMAND_SPACING_MS);
+        control.setInterval(30, toUs);
+        assert.deepEqual(sent, [[30, fromUs], [30, toUs]], 'the slowdown is sent');
+        // Both the old rate and the new one sit in the tolerance band of the new interval.
+        for (let i = 0; i < 20; i++) {
+            t.mock.timers.tick(fromUs / 1000);
+            control.noteMessage(30);
+        }
+        for (let i = 0; i < 10; i++) {
+            t.mock.timers.tick(toUs / 1000);
+            control.noteMessage(30);
+        }
+        assert.equal(control.acceptedIntervalUs(30), fromUs, `${fromUs} -> ${toUs}: frames are no ack`);
+        assert.equal(control.reRequest(30), true, 'unconfirmed: can be asked again');
+        control.handleAck(ACK);
+        assert.equal(control.acceptedIntervalUs(30), toUs, 'an explicit ack confirms it');
+        control.stop();
+    }
+});
+
+test('a speed-up acknowledged by its rate still sends its queued command', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1000 });
+    const sent = [];
+    // 1 s round trip: the command in flight waits 3 s for its ack.
+    const control = new MavlinkStreamControl({ sendCommand: (msgid, us) => sent.push([msgid, us]), roundTripMs: () => 1000 });
+    control.setInterval(65, 1000000); // in flight, never answered
+    control.setInterval(30, 100000);  // queued behind it
+    for (let i = 0; i < 25; i++) {
+        t.mock.timers.tick(100);
+        control.noteMessage(30);      // the FC already streams it at 10 Hz
+    }
+    assert.equal(control.acceptedIntervalUs(30), 100000, 'implicitly acknowledged');
+    assert.equal(sent.some(([msgid]) => msgid === 30), false, 'sanity: still queued');
+    for (let i = 0; i < 10; i++) {
+        t.mock.timers.tick(1000);
+    }
+    assert.ok(sent.some(([msgid, us]) => msgid === 30 && us === 100000), 'the command went out anyway');
+});
+
+test('after a send without an ack, the next change always goes out, even back to the accepted interval', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1000 });
+    const { control, sent } = makeControl();
+    control.setInterval(30, 500000);
+    control.handleAck(ACK);
+    t.mock.timers.tick(COMMAND_SPACING_MS);
+    control.setInterval(30, 100000); // boost: both attempts unanswered
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS);
+    t.mock.timers.tick(COMMAND_SPACING_MS);
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS);
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS);
+    assert.deepEqual(sent, [[30, 500000], [30, 100000], [30, 100000]]);
+    assert.equal(control.acceptedIntervalUs(30), 500000);
+    control.setInterval(30, 500000); // unboost: the FC may be at either rate
+    assert.deepEqual(sent.at(-1), [30, 500000]);
+    control.handleAck(ACK);
+    t.mock.timers.tick(COMMAND_SPACING_MS);
+
+    // Mirror: the boost is acknowledged, the unboost is not, the re-boost must still be sent.
+    control.setInterval(30, 100000);
+    control.handleAck(ACK);
+    t.mock.timers.tick(COMMAND_SPACING_MS);
+    control.setInterval(30, 500000);
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS);
+    t.mock.timers.tick(COMMAND_SPACING_MS);
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS);
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS);
+    assert.equal(control.acceptedIntervalUs(30), 100000);
+    const before = sent.length;
+    control.setInterval(30, 100000);
+    assert.deepEqual(sent.slice(before), [[30, 100000]]);
+});
+
+test('a late ack after a timeout is not credited to the next command', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1000 });
+    const { control, sent } = makeControl();
+    // X gives up after two unanswered attempts; its ack comes 200 ms later.
+    control.setInterval(30, 100000);
+    control.setInterval(65, 1000000);
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS);
+    t.mock.timers.tick(COMMAND_SPACING_MS);
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS);
+    t.mock.timers.tick(200);
+    assert.equal(control.handleAck(ACK), false, 'nothing in flight: the late ack is discarded');
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS - 200);
+    assert.deepEqual(sent, [[30, 100000], [30, 100000], [65, 1000000]]);
+    assert.equal(control.acceptedIntervalUs(65), undefined, 'Y is not accepted by X\'s ack');
+
+    // X answered only after its resend: the duplicate ack of the resend comes late as well.
+    control.handleAck(ACK);
+    t.mock.timers.tick(COMMAND_SPACING_MS);
+    control.setInterval(30, 500000);
+    control.setInterval(24, 500000);
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS);
+    t.mock.timers.tick(COMMAND_SPACING_MS);
+    assert.equal(control.handleAck(ACK), true, 'answers the resend');
+    t.mock.timers.tick(300);
+    assert.equal(control.handleAck(ACK), false, 'the duplicate finds nothing in flight');
+    t.mock.timers.tick(COMMAND_ACK_TIMEOUT_MS - 300);
+    assert.deepEqual(sent.slice(-1), [[24, 500000]]);
+    assert.equal(control.acceptedIntervalUs(24), undefined);
 });

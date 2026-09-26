@@ -11,9 +11,11 @@ export const REBOOT_NO_SILENCE_MS = 3000;
 export const REBOOT_BACK_TIMEOUT_MS = 15000;
 // The queue drops the callback of an abandoned request; the reboot must not wait for it forever.
 export const REBOOT_REPLY_WATCHDOG_MS = 10000;
-export const REBOOT_PROBE_WATCHDOG_MS = 2000;
-// Two MSP2_INAV_MISC2 attempts of 500 ms each plus queue time.
-export const REBOOT_UPTIME_WATCHDOG_MS = 3000;
+// Queue time on top of the tunnel silence windows a monitor read may wait (2000 / 3000 ms at the 500 ms window).
+export const REBOOT_WATCHDOG_MARGIN_MS = 1500;
+// A probe has one attempt. The uptime read: a probe still pending ahead of it, then two MSP2_INAV_MISC2 attempts.
+const PROBE_WATCHDOG_WINDOWS = 1;
+const UPTIME_WATCHDOG_WINDOWS = 3;
 
 const PHASE_IDLE = 'idle';
 const PHASE_AWAIT_REPLY = 'awaitReply';
@@ -30,6 +32,7 @@ export class TunnelRebootMonitor {
 
     constructor(deps) {
         this.deps = deps;
+        this.silenceWindowMs = deps.silenceWindowMs;
         this.phase = PHASE_IDLE;
         this.timer = null;
         this.token = 0;
@@ -158,7 +161,7 @@ export class TunnelRebootMonitor {
             return;
         }
         if (this.phase === PHASE_VERIFY && now - this.probingSince < REBOOT_BACK_TIMEOUT_MS) {
-            if (now - this.verifyStartedAt >= REBOOT_UPTIME_WATCHDOG_MS) {
+            if (now - this.verifyStartedAt >= this.uptimeWatchdogMs()) {
                 this.onUptime(null);
             }
             return;
@@ -249,7 +252,7 @@ export class TunnelRebootMonitor {
 
     sendProbe() {
         const now = Date.now();
-        if (this.probe && now - this.probe.sentAt < REBOOT_PROBE_WATCHDOG_MS) {
+        if (this.probe && now - this.probe.sentAt < this.probeWatchdogMs()) {
             return;
         }
         const probe = { sentAt: now };
@@ -289,6 +292,14 @@ export class TunnelRebootMonitor {
             this.callerCallback = null;
             this.deps[outcome]();
         }
+    }
+
+    probeWatchdogMs() {
+        return PROBE_WATCHDOG_WINDOWS * this.silenceWindowMs() + REBOOT_WATCHDOG_MARGIN_MS;
+    }
+
+    uptimeWatchdogMs() {
+        return UPTIME_WATCHDOG_WINDOWS * this.silenceWindowMs() + REBOOT_WATCHDOG_MARGIN_MS;
     }
 
     stop() {

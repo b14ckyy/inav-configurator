@@ -14,7 +14,7 @@ When the Configurator is connected to a port that speaks MAVLink but not MSP (ty
 | `js/mavlink/mavlinkStreamControl.js` | `MAV_CMD_SET_MESSAGE_INTERVAL` queue, acks, restore list |
 | `js/mavlink/mavlinkTelemetryFeed.js` | Answers covered MSP reads from telemetry ("virtual replies") |
 | `js/mavlink/tunnelRebootMonitor.js` | Confirms `MSP_SET_REBOOT` on a link that survives the reboot |
-| `js/serial_queue.js` | Tunnel mode of the MSP scheduler |
+| `js/serial_queue.js` | Tunnel mode of the MSP scheduler, adaptive silence window |
 | `js/msp.js` | Lost-reply bookkeeping, decoder reset, virtual-reply and reboot hooks |
 | `js/serial_backend.js` | Detection, handshake, GCS heartbeat, reboot glue, feed start/stop |
 | `js/periodicStatusUpdater.js` | Status polling cadence in tunnel mode |
@@ -72,16 +72,21 @@ The status bar shows the link type (`linkTypeMsp`, `linkTypeMavlinkTunnel`, and 
 
 ## Scheduler rules in tunnel mode
 
-`mspQueue.setTunnelMode(true)` (`js/serial_queue.js`) changes the scheduler as follows. Every rule traces back to the firmware contract above.
+`mspQueue.setTunnelMode(true, serialBaud)` (`js/serial_queue.js`) changes the scheduler as follows. Every rule traces back to the firmware contract above.
 
 - **One request in flight.** The FC has one parser per port and replies carry no request id, so a second request in flight could not be matched and could corrupt the first. The lock method is forced to `hard`. `isLocked()` stays true while `tunnelPending` is set. The balancer does not force-free the hard lock while a tunnel request is pending. `freeHardLockAfterFrame()` keeps an unrelated frame from releasing the slot. The timer is kept off `request.timer`, because `MSP.callbacks_cleanup()` clears that on every tab switch and would leave the slot locked forever. Leaving tunnel mode restores the lock method the user chose meanwhile (Wireless mode checkbox).
-- **500 ms silence timeout, restarted per chunk** (`TUNNEL_SILENCE_TIMEOUT_MS`). Each received chunk calls `notifyTunnelProgress()`, so a long multi-chunk reply is not cut off while a lost chunk is detected quickly. The Configurator's own connection timeout is not used in tunnel mode.
-- **5 s first window for slow handlers** (`TUNNEL_SLOW_REQUEST_TIMEOUT_MS`). These handlers write the config flash before replying, which blocks the FC well over a second before the first reply byte: `MSP_EEPROM_WRITE`, `MSP_SELECT_SETTING`, `MSP_RESET_CONF`, `MSP_WP_MISSION_SAVE`, `MSP2_INAV_SELECT_BATTERY_PROFILE`, `MSP2_INAV_SELECT_MIXER_PROFILE`. `MSP_SET_REBOOT` is in the same set (the plain path's `getTimeout()` also gives it 5 s), although its handler does not write flash. Chunk progress never shortens the long window.
+- **Silence timeout, restarted per chunk.** Each received chunk calls `notifyTunnelProgress()`, so a long multi-chunk reply is not cut off while a lost chunk is still detected. The Configurator's own connection timeout is not used in tunnel mode.
+- **The silence window adapts to the link** (`tunnelSilenceWindowMs()`): `clamp(max(prior, learned), 500 ms, 3000 ms)`. A reply queues behind whatever telemetry the FC already put into its 255-byte TX ring. At 4800 baud the ring alone takes 531 ms to drain, and a fixed 500 ms window turned late replies into false losses, retries and duplicates, even with nothing but the port's default streams. No chunk was lost on that path in the measurement, which ran a firmware whose reply chunks wait for TX room (iNavFlight/inav#12036). `maintenance-10.x` without that fix drops a chunk that does not fit (see above); the retry covers it.
+  - **Prior**, set by `setTunnelMode()`: for a serial port, the time to drain the TX ring (255 bytes), one reply chunk (145) and the request (60) at 10 bits per byte, plus 200 ms. That is 1158 ms at 4800 baud, 679 ms at 9600, and the 500 ms floor from 19200 up. `serial_backend.js` passes `CONFIGURATOR.connection.bitrate`, the value `getTimeout()` and the status-poll interval use, for a serial connection only. TCP, UDP and BLE report a nominal 115200 whatever radio sits behind them, so they start at 500 ms. The serial baud only stands in for the FC's UART rate: it is right when the Configurator's port is that UART (e.g. through a transparent serial radio at the same rate), and meaningless behind a USB-CDC radio module, whose port setting says nothing about the air link. The learned part covers that case.
+  - **Learned:** 1.5 × the largest latency seen, as a decaying maximum. It takes the first-chunk latency and every gap between chunks of each answered request, except slow codes (their reply waits for flash). For a retry, the first chunk may be an earlier attempt's reply, so measured from the retry it is a lower bound. Chunk timing restarts when a partial reply is dropped (lapse, 1 s reassembly timeout), so a stray chunk cannot turn a wait into a gap. A window of 3 × the average RTT was measured and still timed out, because the average sags between bursts.
+  - **Every stale reply** raises it at once to 1.5 × its lateness since its request was sent, except for slow codes. For the duplicate after a retry, the answer the retry took counts too, measured from the earlier attempt: the duplicate proves that answer was the earlier attempt's late reply.
+  - **Decay:** 10 % per full minute without a stale reply, never below the prior. A lapse without a reply does not hold it: a real loss says nothing about lateness. The learned value is stored capped at 3000 ms. A change is logged on the console; `mspQueue.getTunnelSilenceWindow()` returns the current value.
+- **5 s first window for slow handlers** (`TUNNEL_SLOW_REQUEST_TIMEOUT_MS`, or the silence window if that is longer). These handlers write the config flash before replying, which blocks the FC well over a second before the first reply byte: `MSP_EEPROM_WRITE`, `MSP_SELECT_SETTING`, `MSP_RESET_CONF`, `MSP_WP_MISSION_SAVE`, `MSP2_INAV_SELECT_BATTERY_PROFILE`, `MSP2_INAV_SELECT_MIXER_PROFILE`. `MSP_SET_REBOOT` is in the same set (the plain path's `getTimeout()` also gives it 5 s), although its handler does not write flash. Chunk progress never shortens the long window.
 - **One retry, none for reboot.** A lapsed request is retried once as a whole (`TUNNEL_DEFAULT_RETRIES`), with fresh MAVLink framing and at the front of the queue, so a later write cannot overtake it. `MSP_SET_REBOOT` gets no retry: the FC replies and then reboots, so a resend after a lost reply would reboot the freshly started FC a second time. Callers can set their own budget: the probe has 2 retries, the reboot monitor's liveness probe 0 and its uptime read 1.
 - **Decoder reset.** On every lapse, `resetDecoders()` resets the MSP decoder (`MSP.resetDecoder()`) and the link's reassembly clock. A lost chunk leaves the decoder mid-frame, and the next reply would otherwise be eaten as its payload. `MavlinkLink` also resets the MSP decoder when a chunk arrives 1000 ms or more after the previous one, mirroring the FC's partial-frame timeout.
-- **Stale watch after a lapse.** `watchStale()` opens a one-shot 500 ms window for the lapsed code. A late reply of the lapsed attempt that arrives while nothing of that code is pending is dropped (`admitReply()` returns false). While the window is open, the next non-retry request of that code is held at the head of the queue. Nothing overtakes it, so FIFO order (and write order) is kept. The retry itself is not held back, and a late reply arriving while the retry is pending answers the retry.
-- **Stale watch after a retried request (the misattribution case).** Take a read of `MSP_WP` for waypoint 3 whose first attempt lapses. The retry goes out, and the late reply of attempt 1 answers it. The retry's own reply can still follow, as late as the first one was. If the next request is `MSP_WP` for waypoint 4, that duplicate (waypoint 3 data) would be taken as its answer. `updateWatchOnAnswer()` therefore opens a duplicate watch of `min(2 s, time-to-answer + 500 ms)`. During it, a same-code request with a different payload, or any same-code request after a write went out, is held back until the duplicate arrives (and is dropped) or the window ends. An identical re-read with no write in between is deliberately not held, so a 20 Hz poller recovers within the burst. It may take the duplicate, which is the same query one poll older, and then its own reply becomes the expected duplicate.
-- **Coalescing.** `mspDeduplicationQueue` already rejects a request whose code is queued or in flight. In tunnel mode, `MSP._enqueue()` then calls `mspQueue.coalesce()`, which attaches an identical read (same code, same payload) to the queued or in-flight request. This replaces a put-retry chain per rejected poll. Each caller gets its own `DataView`, because readers keep their offset on it. **Write guard:** a read is never shared when a write is queued behind it, because a re-read after a SET needs post-SET data. Writes never coalesce.
+- **Stale watch after a lapse.** `watchStale()` opens a one-shot watch, one silence window long, for the lapsed code. A late reply of the lapsed attempt that arrives while nothing of that code is pending is dropped (`admitReply()` returns false). While the window is open, the next non-retry request of that code is held at the head of the queue. Nothing overtakes it, so FIFO order (and write order) is kept. The retry itself is not held back, and a late reply arriving while the retry is pending answers the retry.
+- **Stale watch after a retried request (the misattribution case).** Take a read of `MSP_WP` for waypoint 3 whose first attempt lapses. The retry goes out, and the late reply of attempt 1 answers it. The retry's own reply can still follow, as late as the first one was. If the next request is `MSP_WP` for waypoint 4, that duplicate (waypoint 3 data) would be taken as its answer. `updateWatchOnAnswer()` therefore opens a duplicate watch of `min(max(2 s, window), time-to-answer + window)`. During it, a same-code request with a different payload, or any same-code request after a write went out, is held back until the duplicate arrives (and is dropped) or the window ends. An identical re-read with no write in between is deliberately not held, so a 20 Hz poller recovers within the burst. It may take the duplicate, which is the same query one poll older, and then its own reply becomes the expected duplicate.
+- **Coalescing.** `mspDeduplicationQueue` already rejects a request whose code is queued or in flight. In tunnel mode, `MSP._enqueue()` then calls `mspQueue.coalesce()`, which attaches an identical read (same code, same payload) to the queued or in-flight request, never to one abandoned by a tab switch (its reply fires no callback). This replaces a put-retry chain per rejected poll. Each caller gets its own `DataView`, because readers keep their offset on it. **Write guard:** a read is never shared when a write is queued behind it, because a re-read after a SET needs post-SET data. Writes never coalesce.
 - **Round-trip samples** (`roundtripSample()`) are measured from the last send and skipped for retried or held-back requests, so the silence window does not inflate the RTT shown in the status bar.
 - **Tab switch.** `callbacks_cleanup()` calls `abandonPending()`. The pending request keeps the slot until its reply or timeout, but gets no retry and no callback.
 
@@ -121,25 +126,34 @@ With the feed on, `startTelemetryFeed()` creates a `MavlinkTelemetryFeed` after 
 
 - **Seed and refresh:** the code was answered over the wire this session, less than `WIRE_REFRESH_MS` (10 s) ago, and it is not in `lostReplies` or `parseFailures`. Fields MAVLink does not carry keep their last MSP value, so there must be a recent one. The stamp is taken in `noteWireReply()`, only for a reply that answered its own request.
 - **Acknowledged:** every source message's interval was acknowledged.
-- **Fresh:** every source message was seen within `max(3 × interval, 3 s)`.
+- **Fresh:** every source message was seen within `max(3 × interval, 3 s)`, with the slower of the acknowledged and the requested interval, so a stream just slowed down is judged at its new rate. A source switched off (interval −1) is skipped for a code with other sources; a code whose only source is off goes on the wire.
 - **RC channel count:** `MSP_RC` stays on the wire when `RC_CHANNELS.chancount` exceeds 18.
 
 A virtual reply fires its callbacks on the next tick. A tab switch cancels those that have not fired yet (`cancelPending()`). Each fallback reason other than the refresh is logged once per code.
 
-**`MSP_SENSOR_STATUS` stays on the wire.** It is the only MSP command that sets the FC's `isMspConfigActive()` (`fc_msp.c`), and that flag lapses 1000 ms after the last call (`fc_core.c`). With `blackbox_arm_control = -1`, blackbox logging starts and stops on this flag. In tunnel mode with the feed, `js/periodicStatusUpdater.js` therefore polls `MSP_SENSOR_STATUS` every 500 ms, and `MSPV2_INAV_STATUS` plus `MSPV2_INAV_ANALOG` every second run (1 Hz). `MSP_ACTIVEBOXES` is not polled in tunnel mode, because `MSPV2_INAV_STATUS` carries the same box bitmask (`applyInavStatusBoxModes()` in MSPHelper).
+**`MSP_SENSOR_STATUS` stays on the wire.** It is the only MSP command that sets the FC's `isMspConfigActive()` (`fc_msp.c`), and that flag lapses 1000 ms after the last call (`fc_core.c`). With `blackbox_arm_control = -1`, blackbox logging starts and stops on this flag. In tunnel mode, with or without the feed, `js/periodicStatusUpdater.js` therefore polls `MSP_SENSOR_STATUS` every 500 ms, and `MSPV2_INAV_STATUS` plus `MSPV2_INAV_ANALOG` every second run (1 Hz). `MSP_ACTIVEBOXES` is not polled in tunnel mode, because `MSPV2_INAV_STATUS` carries the same box bitmask (`applyInavStatusBoxModes()` in MSPHelper). A plain MSP link keeps its four requests per run at the baud-rate interval.
 
 **Streams are requested explicitly.** A MAVLink port other than port 1 streams only `HEARTBEAT` by default (`docs/Mavlink.md`, "Relevant CLI settings"), and a radio link is usually not port 1. `BASE_INTERVALS_US` requests `SYS_STATUS`, `ATTITUDE`, `VFR_HUD` and `GPS_RAW_INT` at 2 Hz, and `BATTERY_STATUS` and `RC_CHANNELS` at 1 Hz. The requests use `COMMAND_LONG` / `MAV_CMD_SET_MESSAGE_INTERVAL`, sent directly on the connection rather than through the MSP queue. `MavlinkStreamControl` rules:
 
 - **One command in flight:** `COMMAND_ACK` names the command but not the message id it answers.
-- **Pacing:** 50 ms spacing between commands.
-- **Ack timeout:** `max(500 ms, 3 × RTT)`, then one resend.
-- **Collapsing:** queued commands for one id collapse, and an unchanged interval is not sent again.
-- **Implicit ack:** a message observed at ≥ 0.8 × the requested rate for 2 s counts as acknowledged even if the ack was lost. The FC reschedules one interval after each send, so streams run slightly slow.
-- **Re-request:** an accepted stream that goes quiet is requested again, at most once per 10 s per message. An FC reboot drops every override.
+- **Pacing:** 50 ms spacing between commands. After a command needed its resend or went unanswered, the next command waits one ack timeout instead: a late ack of the earlier attempt then finds nothing in flight and is discarded, instead of being credited to the next message id.
+- **Ack timeout:** `max(500 ms, 3 × RTT)`, then one resend. An accepted interval recorded before the send does not cancel the resend; only its rate observed while the command is in flight does.
+- **Collapsing:** queued commands for one id collapse, and an unchanged interval is not sent again. After a command went out without an ack, the FC may run either interval (`isUnconfirmed()`), so the next change for that id is always sent, even back to the accepted one.
+- **Implicit ack, speed-ups only:** a message observed at 0.8 to 1.5 × a requested higher rate for 2 s counts as acknowledged even if the ack was lost. The FC reschedules one interval after each send, so streams run slightly slow. A slowdown (a longer interval than the accepted one, e.g. an unboost) is confirmed by its explicit ack only: frames at the old, faster rate cannot tell a command that arrived from one that did not. A queued command is sent even when its rate was observed before it went out.
+- **Re-request,** at most once per 10 s per message and six times per message per session (`MAX_RE_REQUESTS`, one log line when reached), each with the usual two attempts:
+  - an accepted stream that goes quiet (an FC reboot drops every override);
+  - an interval still unconfirmed 10 s after it went out, boost included, also when it equals the accepted one (the stream control gives up after two unanswered attempts, and a busy link drops acks);
+  - an accepted stream never received within its fresh window after the command went out, because `COMMAND_ACK` names no message id and may belong to another command. At most twice per session (`NEVER_SEEN_RE_REQUESTS`): the FC accepts messages it does not send, e.g. `GPS_RAW_INT` without a GPS.
 
 The base result is logged as `mavlinkTelemetryStreamsActive` or `mavlinkTelemetryNoAck`.
 
-**Boost/unboost:** three virtual `MSP_ATTITUDE` or `MSP_RC` serves within 1 s raise `ATTITUDE` or `RC_CHANNELS` to 10 Hz. After 2 s without such a request, they drop back to the base rate.
+**Boost/unboost:** three virtual `MSP_ATTITUDE` or `MSP_RC` serves within 1 s raise `ATTITUDE` or `RC_CHANNELS` to 10 Hz. After 2 s without such a request, they drop back to their interval in the base set.
+
+**Bandwidth guard.** Push telemetry does not pace itself, so the feed keeps its own traffic small and simple:
+
+- **Boost on demand, unboost on idle** (above). A boost runs at whatever the link delivers; nothing judges or backs it off. On a slow link it simply delivers less than 10 Hz.
+- **Unconfirmed commands are requested again** (see Re-request above), so a boost or unboost lost with its acks does not leave the FC at the wrong rate for the session.
+- **Slow serial start** (`REDUCED_INTERVALS_US`): when the session runs on a serial port at 9600 baud or less (`mspQueue.hasSlowSerialPrior()`, from the baud passed to `setTunnelMode()`), the feed starts with the reduced set and never boosts, and logs this once. The reduced set has `SYS_STATUS`, `ATTITUDE` and `GPS_RAW_INT` at 1 Hz, `VFR_HUD` and `BATTERY_STATUS` at 0.5 Hz, and `RC_CHANNELS` off (−1, which the FC accepts as "disabled"). `MSP_RC` then goes on the wire, and `ANALOG.rssi` comes from the 10 s wire refresh. At 4800 baud (480 B/s) the base set (about 370 B/s) plus a boost (about 680 B/s) overran the FC's TX ring and cost multi-chunk replies. The reduced set is used only from the start; nothing switches to it later. Anything else a user finds too slow is covered by the feed switch below.
 
 **Restore before disconnect:** `stopTelemetryFeed(true, done)` sends interval 0 for every message id it touched. In the firmware, interval 0 clears the override, back to the port's default. The frames go out one at a time, 20 ms apart, and the port closes after the last write callback or after a 300 ms deadline. Without a restore, the FC keeps the Configurator's intervals until its next reboot. During a reboot and on session teardown, the feed stops without a restore.
 
@@ -167,7 +181,7 @@ On start (`onTunnelRebootStart()`), the monitor:
 - sets `connectionValid = false`;
 - stops the feed without a restore.
 
-Any MAVLink frame from the locked target counts as a sign of life (`noteFcActivity()`). Liveness probes are `MSP_API_VERSION` every 500 ms with no retry.
+Any MAVLink frame from the locked target counts as a sign of life (`noteFcActivity()`). Liveness probes are `MSP_API_VERSION` with no retry, at most one at a time, checked every 500 ms; a probe without an answer after one silence window + 1.5 s (`probeWatchdogMs()`) is replaced.
 
 | Case | Rule |
 |---|---|
@@ -177,7 +191,7 @@ Any MAVLink frame from the locked target counts as a sign of life (`noteFcActivi
 
 **Uptime rule:** `MSP2_INAV_MISC2` starts with the FC's on-time in seconds (u32, `fc_msp.c`); MSPHelper parses it into `FC.MISC2.onTime` (`null` on an error reply), and the monitor reads that inside its callback. An uptime shorter than the time since the reboot request means the FC rebooted. The uptime is what decides, because a link fade looks like a reboot and a fast reboot can hide between two heartbeats.
 
-**No blind resend:** a lost reply never triggers a resend on its own, since the FC may already have rebooted and a resend would reboot it again. A single resend (`mavlinkTunnelRebootResend`) happens only when the reply was lost and a readable uptime proves the FC did not reboot, meaning the request itself was lost. If the uptime cannot be read (two lost reads, or 3 s):
+**No blind resend:** a lost reply never triggers a resend on its own, since the FC may already have rebooted and a resend would reboot it again. A single resend (`mavlinkTunnelRebootResend`) happens only when the reply was lost and a readable uptime proves the FC did not reboot, meaning the request itself was lost. If the uptime cannot be read (two lost reads, or no answer within 3 silence windows + 1.5 s, `uptimeWatchdogMs()`: 3 s at the 500 ms window):
 
 - a silence verdict stands (rebooted);
 - after a received reply, it counts as not rebooted;
@@ -207,7 +221,7 @@ The parser rejects any id without an entry, advancing one byte, and `encodeFrame
 4. Optionally add the code to `BOOSTABLE`.
 5. Never cover `MSP_SENSOR_STATUS`, and do not cover a read whose FC state is not fully derivable unless the 10 s wire refresh is acceptable for the rest.
 
-**Adding a slow code:** if a new MSP handler writes the config flash before replying, add it to `TUNNEL_SLOW_REQUEST_CODES` in `js/serial_queue.js`. Otherwise its first reply byte arrives after the 500 ms silence timeout, and the request is retried while the FC is still writing.
+**Adding a slow code:** if a new MSP handler writes the config flash before replying, add it to `TUNNEL_SLOW_REQUEST_CODES` in `js/serial_queue.js`. Otherwise its first reply byte arrives after the silence window, and the request is retried while the FC is still writing.
 
 ## Testing
 
@@ -217,12 +231,12 @@ The parser rejects any id without an entry, advancing one byte, and `encodeFrame
 |---|---|
 | `tests/mavlink-parser.test.mjs` | Parser: golden frames, zero-extension, resync after a stray magic byte or CRC error, signed and MAVLink 1 frames, split input, heartbeat filter |
 | `tests/mavlink-tunnel.test.mjs` | TUNNEL codec byte-for-byte against the firmware, reply filter, multi-chunk reassembly into `MSP.read`, 1000 ms gap reset |
-| `tests/mavlink-command.test.mjs` | `COMMAND_LONG`/`COMMAND_ACK` codecs, stream control: one in flight, resend, collapse, implicit ack, RTT-scaled timeout, re-request |
+| `tests/mavlink-command.test.mjs` | `COMMAND_LONG`/`COMMAND_ACK` codecs, stream control: one in flight, resend, collapse, implicit ack (speed-ups only), RTT-scaled timeout, re-request, send time, refusal, change after an unconfirmed send |
 | `tests/mavlink-telemetry.test.mjs` | MAVLink → `FC.*` per message, compared with what `fc_msp.c` would send; the approximations above |
-| `tests/msp-tunnel-scheduler.test.mjs` | Tunnel mode: one in flight, silence timer, retry budgets, slow window, stale watches, misattribution, coalescing and its write guard, lost-read blocking, decoder reset, tab switch |
+| `tests/msp-tunnel-scheduler.test.mjs` | Tunnel mode: one in flight, silence timer, adaptive window (prior per baud, learned from slow and stale replies, decay, cap, slow codes excluded), retry budgets, slow window, stale watches, misattribution, coalescing and its write guard, lost-read blocking, loss-burst recovery, decoder reset, tab switch |
 | `tests/msp-tunnel-write-lost.test.mjs` | Lost write: no callback, one message per write, recovery hook, no message for live writes or lost reads |
-| `tests/msp-tunnel-reboot.test.mjs` | Every reboot-monitor case against a fake FC: fades, fast reboots, lost request/reply/uptime, armed refusal, single resend |
-| `tests/msp-virtual-reply.test.mjs` | Feed: seed, freshness, ack, 10 s refresh, `MSP_SENSOR_STATUS` never virtual, boost/unboost, cancel on tab switch, restore on disconnect, feed off |
+| `tests/msp-tunnel-reboot.test.mjs` | Every reboot-monitor case against a fake FC: fades, fast reboots, lost request/reply/uptime, armed refusal, single resend, watchdogs on a wide silence window |
+| `tests/msp-virtual-reply.test.mjs` | Feed: seed, freshness, ack, 10 s refresh, `MSP_SENSOR_STATUS` never virtual, boost/unboost, unconfirmed and never-received re-requests, slow serial start, cancel on tab switch, restore on disconnect, feed off |
 | `tests/periodic-status-tunnel.test.mjs` | Polling cadence for plain MSP, tunnel with feed, tunnel without feed |
 | `tests/msp-status-box-modes.test.mjs` | Box bitmask parsed from `MSPV2_INAV_STATUS` |
 
@@ -230,6 +244,6 @@ The parser rejects any id without an entry, advancing one byte, and `encodeFrame
 
 SITL's `systemReset()` closes every socket and re-executes, so a reboot drops the TCP connection, unlike a radio link. To exercise the reboot monitor end to end, put a small relay in between: it listens on a local port for the Configurator and reconnects to 5761 across the reset. No such script is shipped.
 
-## Temporary A/B switch
+## Telemetry feed switch
 
-The Options tab has a "MAVLink telemetry feed (experimental)" checkbox (store key `mavlink_telemetry_feed`, read once per connect). When it is off, the tunnel session stays on pure MSP polling at 1 Hz. The checkbox and everything marked `// phase-2 A/B` (including the 10 s wire/virtual counter on the console) are removed before merge.
+The Options tab has a "MAVLink telemetry feed" checkbox (store key `mavlink_telemetry_feed`, default on, read once per connect). The feed helps on high-latency radio links, where one MSP round trip costs more than the telemetry does; on a very slow wire with low latency (e.g. 4800 baud), pure MSP polling can be faster. When it is off, the tunnel session stays on MSP polling (the same status cadence as above) and sends no stream commands. While the feed runs, a console line every 10 s counts the covered reads that went on the wire and those answered from telemetry.
