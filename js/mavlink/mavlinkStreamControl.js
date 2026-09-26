@@ -184,7 +184,7 @@ export class MavlinkStreamControl {
     // No command needed: the interval is already in effect or on its way.
     _markInEffect(msgid) {
         const requested = this._requested.get(msgid);
-        if (requested && requested.sentAt === null) {
+        if (requested?.sentAt === null) {
             requested.sentAt = this._now();
         }
     }
