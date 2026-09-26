@@ -747,7 +747,7 @@
         "message": "MSP over MAVLink: flight controller uptime $1 s, reboot requested $2 s ago"
     },
     "mavlinkTunnelRebootUptimeUnavailable": {
-        "message": "MSP over MAVLink: flight controller uptime could not be read, going by its silence alone"
+        "message": "MSP over MAVLink: flight controller uptime could not be read"
     },
     "mavlinkTunnelRebootAlreadyRunning": {
         "message": "MSP over MAVLink: a reboot is already being confirmed, the second reboot request was not sent"
@@ -756,7 +756,7 @@
         "message": "MSP over MAVLink: flight controller is back after the reboot, reconnecting"
     },
     "mavlinkTunnelRebootNotRebooted": {
-        "message": "<span style=\"color: red\">The flight controller did not reboot</span> (it may be armed). The connection stays open; changes that need a reboot are not active until you reboot or power-cycle it."
+        "message": "<span style=\"color: red\">The flight controller did not confirm a reboot</span> (it may be armed, or the request was lost). The connection stays open; changes that need a reboot are not active until you reboot or power-cycle it."
     },
     "mavlinkTunnelRebootNotBack": {
         "message": "<span style=\"color: red\">The flight controller did not come back after the reboot.</span> Reconnect manually."

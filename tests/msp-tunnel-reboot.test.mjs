@@ -442,6 +442,36 @@ test('request lost and the uptime never readable: no resend, not rebooted after 
     assert.ok(fc.uptimeReads > 2, 'the uptime is retried within the 15 s budget');
 });
 
+test('request lost during a fade, MISC2 lost twice then answered large: the silence is no verdict, resent once', (t) => {
+    const session = startSession(t, { rebootMs: 2000, dropRequests: 1, fadeOnRequestMs: 2000, dropMisc2: 2 });
+    sendReboot(session);
+    advance(t, REBOOT_REPLY_WINDOW_MS + 2000);
+    assert.deepEqual(session.outcomes, [], 'silence plus an unreadable uptime must not read as rebooted');
+    assert.deepEqual(session.logs.slice(0, 5), ['mavlinkTunnelRebootSilent', 'mavlinkTunnelRebootReplyLost',
+        'mavlinkTunnelRebootUptimeUnavailable', UPTIME, 'mavlinkTunnelRebootResend']);
+    assert.equal(fc.rebootRequests, 2);
+    advance(t, 4000);
+    assert.deepEqual(session.outcomes, ['back']);
+    assert.equal(fc.rebootRequests, 2, 'exactly one resend');
+    assert.equal(fc.reboots, 1);
+    assert.equal(session.callerReplies, 1, 'the resend reply completes the original caller');
+});
+
+test('request lost during a fade and the uptime never readable: no back, not rebooted after 15 s', (t) => {
+    const session = startSession(t, { rebootMs: 2000, dropRequests: 1, fadeOnRequestMs: 2000, dropMisc2: Infinity });
+    sendReboot(session);
+    advance(t, REBOOT_REPLY_WINDOW_MS + REBOOT_BACK_TIMEOUT_MS - 500);
+    assert.deepEqual(session.outcomes, []);
+    assert.ok(session.logs.includes('mavlinkTunnelRebootSilent'));
+    advance(t, 1000);
+    assert.deepEqual(session.outcomes, ['notRebooted']);
+    assert.equal(session.logs.includes('mavlinkTunnelRebootBack'), false);
+    assert.equal(fc.rebootRequests, 1, 'no resend without a positive uptime reading');
+    assert.equal(fc.reboots, 0);
+    assert.equal(session.callerReplies, 0);
+    assert.ok(fc.uptimeReads > 2, 'the uptime is retried within the 15 s budget');
+});
+
 // --- watchdogs, cancel, a second request ---------------------------------------------------------
 
 test('an abandoned reboot request (no callback ever) is treated as lost after 10 s', (t) => {

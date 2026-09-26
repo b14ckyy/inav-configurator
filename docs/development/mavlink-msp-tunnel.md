@@ -193,9 +193,8 @@ Any MAVLink frame from the locked target counts as a sign of life (`noteFcActivi
 
 **No blind resend:** a lost reply never triggers a resend on its own, since the FC may already have rebooted and a resend would reboot it again. A single resend (`mavlinkTunnelRebootResend`) happens only when the reply was lost and a readable uptime proves the FC did not reboot, meaning the request itself was lost. If the uptime cannot be read (two lost reads, or no answer within 3 silence windows + 1.5 s, `uptimeWatchdogMs()`: 3 s at the 500 ms window):
 
-- a silence verdict stands (rebooted);
-- after a received reply, it counts as not rebooted;
-- after a lost reply, probing continues, because a resend needs a positive reading.
+- after a received reply, a silence verdict stands (rebooted); without silence it counts as not rebooted;
+- after a lost reply, probing continues and the next answer reads the uptime again, even after a silence: a link fade looks the same, and the request may never have arrived. Only an uptime reading ends it early; otherwise the 15 s budget does (see Outcomes).
 
 Outcomes:
 
@@ -203,7 +202,7 @@ Outcomes:
 |---|---|---|
 | Rebooted | `mavlinkTunnelRebootBack` | The caller's callback has run on the reply, or runs now with a synthetic `{command: MSP_SET_REBOOT}` if the reply was lost, so its dialogs close. `FC.resetState()`, `parseFailures`/`lostReplies` cleared, and the tunnel handshake runs again without closing the port; `onValidFirmware()` then reopens the tab. |
 | Not rebooted | `mavlinkTunnelRebootNotRebooted` | A caller whose reply was lost is never called back. The defaults dialog's saving modal is closed, and the session resumes: feed, status polling, tab. |
-| Gone (15 s without a verdict) | `mavlinkTunnelRebootNotBack` | Disconnects. If the FC answered all along without a readable uptime, the outcome is "not rebooted" instead. |
+| Gone (15 s without a verdict) | `mavlinkTunnelRebootNotBack` | Disconnects. If the FC is still answering without a readable uptime, the outcome is "not rebooted" instead: after a received reply only when it never went silent, after a lost reply also when it came back after a silence. |
 
 ## Extending
 

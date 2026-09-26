@@ -184,8 +184,10 @@ export class TunnelRebootMonitor {
     probingOutcome(now) {
         const elapsed = now - this.probingSince;
         if (elapsed >= REBOOT_BACK_TIMEOUT_MS) {
-            // Answering all along without a readable uptime: whether it rebooted is unknown, so no resend.
-            return this.probeAnswered && !this.silenceSeen ? 'onNotRebooted' : 'onGone';
+            // Alive without a readable uptime: whether it rebooted is unknown, so no resend.
+            // After a lost reply, back after a silence is no verdict either: a link fade looks the same.
+            const alive = this.silenceSeen ? this.mode === 'afterLoss' && this.backSeen : this.probeAnswered;
+            return alive ? 'onNotRebooted' : 'onGone';
         }
         // Never silent after the reply: refused (armed), unless the reboot was shorter than a probe gap.
         if (!this.silenceSeen && this.mode === 'afterReply' && elapsed >= REBOOT_NO_SILENCE_MS) {
@@ -194,7 +196,7 @@ export class TunnelRebootMonitor {
         return null;
     }
 
-    // silent: the silence rule already says "rebooted"; it stands if the uptime cannot be read.
+    // silent: the silence rule already says "rebooted"; after a received reply it stands if the uptime cannot be read.
     verify(silent) {
         this.phase = PHASE_VERIFY;
         this.verifySilent = silent;
@@ -226,12 +228,11 @@ export class TunnelRebootMonitor {
 
     onUptimeUnavailable() {
         this.deps.log('mavlinkTunnelRebootUptimeUnavailable');
-        if (this.verifySilent) {
-            this.finish('onBack');
-        } else if (this.mode === 'afterReply') {
-            this.finish('onNotRebooted');
+        if (this.mode === 'afterReply') {
+            this.finish(this.verifySilent ? 'onBack' : 'onNotRebooted');
         } else {
-            // A resend needs a positive uptime reading: the next probe answer tries again.
+            // The request may never have arrived and a fade looks like a reboot: only an uptime reading
+            // decides, so the next sign of life tries again.
             this.phase = PHASE_PROBING;
         }
     }
